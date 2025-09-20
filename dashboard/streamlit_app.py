@@ -108,7 +108,7 @@ else:
 scorer = Scorer(weights={"hard": hard_weight, "soft": soft_weight})
 
 # --- JD Upload ---
-st.markdown("## 1) Upload Job Description")
+st.markdown("## Upload Job Description")
 jd_file = st.file_uploader("Upload JD (PDF / DOCX / TXT)", type=["pdf", "docx", "txt"])
 jd_text = ""
 if jd_file:
@@ -137,7 +137,7 @@ if jd_text:
     candidates = list(dict.fromkeys(candidates))  # dedupe
     auto_skills = candidates[:25]
 
-    st.markdown("### 2) Skills (auto-detected — edit if needed)")
+    st.markdown("### Skills (auto-detected — edit if needed)")
     col1, col2 = st.columns([2, 1])
     with col1:
         must_text = st.text_area("Must-have skills (comma separated)", value=",".join(auto_skills), height=120)
@@ -159,7 +159,7 @@ else:
 st.markdown("---")
 
 # --- Resume Upload ---
-st.markdown("## 3) Upload Resumes")
+st.markdown("## Upload Resumes")
 uploaded = st.file_uploader("Upload Resumes (PDF/DOCX) — multiple allowed", accept_multiple_files=True, type=["pdf", "docx"])
 
 if uploaded and not jd_text:
