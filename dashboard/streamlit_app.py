@@ -296,3 +296,46 @@ if uploaded and jd_text:
                     st.success("Saved vectors.")
                 except Exception as e:
                     st.error(f"Failed to save vectors: {e}")
+
+# inside your streamlit code: after jd upload and resume uploads
+import requests, io
+
+API_BASE = "http://localhost:8000"
+
+# upload JD
+if st.button("Send JD to API"):
+    files = {"file": (jd_file.name, jd_file.getbuffer(), "application/octet-stream")}
+    data = {"title": jd_file.name if jd_file else ""}
+    r = requests.post(f"{API_BASE}/jd/upload", files=files, data=data)
+    if r.ok:
+        job_id = r.json()["job_id"]
+        st.success(f"JD uploaded, job_id={job_id}")
+        st.session_state["job_id"] = job_id
+    else:
+        st.error(f"JD upload failed: {r.text}")
+
+# upload resumes and evaluate via API
+if uploaded and st.button("Upload resumes & evaluate via API"):
+    job_id = st.session_state.get("job_id")
+    if not job_id:
+        st.error("Upload JD first (Send JD to API).")
+    else:
+        results = []
+        for f in uploaded:
+            files = {"file": (f.name, f.getbuffer(), "application/pdf")}
+            r = requests.post(f"{API_BASE}/resume/upload", files=files)
+            if not r.ok:
+                st.warning(f"Resume upload failed for {f.name}")
+                continue
+            resume_id = r.json()["resume_id"]
+            # evaluate with weights taken from UI sliders
+            r2 = requests.post(f"{API_BASE}/evaluate", data={"job_id": job_id, "resume_id": resume_id, "hard_weight": hard_weight, "soft_weight": soft_weight})
+            if r2.ok:
+                results.append({"filename": f.name, "result": r2.json()["result"], "resume_id": resume_id})
+        # show sorted by final score
+        results = sorted(results, key=lambda x: x["result"]["final"], reverse=True)
+        for r in results:
+            st.write(f"**{r['filename']}** — Score: {r['result']['final']} | {r['result']['verdict']}")
+            st.write("Missing:", ", ".join(r["result"]["missing"]["must"] + r["result"]["missing"]["good"]))
+            st.info(r["result"]["feedback"])
+
