@@ -38,7 +38,7 @@ CSS = """
 """
 st.markdown(CSS, unsafe_allow_html=True)
 
-st.markdown("<div class='title'>🦇 Resume Relevance Checker — Batman Theme</div>", unsafe_allow_html=True)
+st.markdown("<div class='title'> Resume Relevance Checker </div>", unsafe_allow_html=True)
 st.caption("Upload a Job Description and candidate resumes. The system returns a relevance score, missing skills, LLM feedback, and downloadable results.")
 
 # --- Sidebar: Settings & API Key ---
