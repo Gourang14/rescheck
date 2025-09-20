@@ -1,83 +1,61 @@
-from typing import Dict, List, Tuple
-import math
+# backend/services/evaluator.py
+from typing import Dict, List
+import numpy as np
 from rapidfuzz import fuzz
-from backend.services.embeddings_manager import EmbeddingsProvider, SBERTEmbeddingsProvider, OpenAIEmbeddingsProvider
+from backend.services.embeddings_manager import SBERTEmbeddingsProvider, OpenAIEmbeddingsProvider, EmbeddingsProvider
 
-from backend.services import nlp_utils  # for skill extraction if needed
+# instantiate embeddings provider (prefer OpenAI if configured)
+def get_default_embeddings_provider():
+    try:
+        # try OpenAI provider if api key present
+        import os
+        if os.getenv("OPENAI_API_KEY"):
+            return OpenAIEmbeddingsProvider(os.getenv("OPENAI_API_KEY"))
+    except Exception:
+        pass
+    # fallback
+    return SBERTEmbeddingsProvider()
 
-# Instantiate an embeddings provider (single global instance okay)
-EMB_PROVIDER = EmbeddingsProvider()
+EMB_PROVIDER = get_default_embeddings_provider()
 
 def cosine_sim(a, b):
-    import numpy as np
-    a = np.array(a)
-    b = np.array(b)
+    a = np.array(a); b = np.array(b)
     denom = (np.linalg.norm(a) * np.linalg.norm(b))
-    if denom == 0:
-        return 0.0
-    return float(np.dot(a, b) / denom)
+    return float(np.dot(a, b) / denom) if denom != 0 else 0.0
 
-def hard_match_score(resume_text: str, must_have: List[str], good_to_have: List[str], threshold=75):
-    """
-    Hard match: calculates coverage percentage of must_have and good_to_have.
-    Returns numeric hard_score (0-100) and missing lists.
-    """
-    # use fuzzy matching for skill presence
+def hard_match_score(resume_text: str, must_have: List[str], good_to_have: List[str], threshold: int = 70):
     found_must = []
-    for skill in must_have:
-        score = fuzz.partial_ratio(skill.lower(), resume_text.lower())
-        if score >= threshold:
-            found_must.append(skill)
-
+    for s in must_have:
+        if fuzz.partial_ratio(s.lower(), resume_text.lower()) >= threshold:
+            found_must.append(s)
     found_good = []
-    for skill in good_to_have:
-        score = fuzz.partial_ratio(skill.lower(), resume_text.lower())
-        if score >= threshold:
-            found_good.append(skill)
+    for s in good_to_have:
+        if fuzz.partial_ratio(s.lower(), resume_text.lower()) >= threshold:
+            found_good.append(s)
 
     must_cov = (len(found_must) / len(must_have)) if must_have else 1.0
     good_cov = (len(found_good) / len(good_to_have)) if good_to_have else 1.0
-
-    # Compose hard score: 70% must, 30% good
-    hard_score = (0.7 * must_cov + 0.3 * good_cov) * 100
-
-    missing_must = [m for m in must_have if m not in found_must]
-    missing_good = [g for g in good_to_have if g not in found_good]
-
-    return round(hard_score, 2), missing_must, missing_good
+    hard_score = (0.75 * must_cov + 0.25 * good_cov) * 100
+    return round(hard_score, 2), [m for m in must_have if m not in found_must], [g for g in good_to_have if g not in found_good]
 
 def soft_match_score(jd_text: str, resume_text: str):
-    """
-    Compute embedding-based cosine similarity (0-100)
-    """
-    # embed
-    jd_vec = EMB_PROVIDER.embed(jd_text)[0]
-    res_vec = EMB_PROVIDER.embed(resume_text)[0]
-    sim = cosine_sim(jd_vec, res_vec)
-    return round(sim * 100, 2)
+    jd_vec = EMB_PROVIDER.embed([jd_text])[0]
+    res_vec = EMB_PROVIDER.embed([resume_text])[0]
+    return round(cosine_sim(jd_vec, res_vec) * 100, 2)
 
 def final_score(resume_text: str, jd_parsed: Dict, weights: Dict = None):
-    """
-    Combine hard and soft into a final score.
-    jd_parsed: contains keys must_have, good_to_have, raw_text
-    weights: {'hard': 0.6, 'soft': 0.4}
-    """
+    # weights can be provided per-job or default
     if weights is None:
-        weights = {'hard': 0.6, 'soft': 0.4}
-
+        weights = {"hard": 0.6, "soft": 0.4}
     hard, missing_must, missing_good = hard_match_score(resume_text, jd_parsed.get("must_have", []), jd_parsed.get("good_to_have", []))
     soft = soft_match_score(jd_parsed.get("raw_text", ""), resume_text)
-
-    combined = round(weights['hard'] * hard + weights['soft'] * soft, 2)
-    # verdict
-    if combined >= 75:
-        verdict = "High"
-    elif combined >= 50:
-        verdict = "Medium"
-    else:
-        verdict = "Low"
-
-    missing = {"must": missing_must, "good": missing_good}
-    breakdown = {"hard": hard, "soft": soft, "final": combined}
-
-    return {"score": combined, "verdict": verdict, "missing": missing, "breakdown": breakdown}
+    final = round(weights["hard"] * hard + weights["soft"] * soft, 2)
+    verdict = "High" if final >= 75 else "Medium" if final >= 50 else "Low"
+    return {
+        "final": final,
+        "verdict": verdict,
+        "hard": hard,
+        "soft": soft,
+        "missing": {"must": missing_must, "good": missing_good},
+        "weights": weights
+    }
