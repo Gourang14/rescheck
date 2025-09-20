@@ -1,55 +1,64 @@
-import os
+# backend/services/feedback.py
+import os, re
 from typing import List
 
-# Edit depending on LLM availability
-try:
-    from openai import OpenAI
-    OPENAI_AVAILABLE = True
-except Exception:
-    OPENAI_AVAILABLE = False
+# stopwords or noise tokens often extracted from naive JD parsing
+NOISE_TOKENS = set(["Job","Role","Description","Overview","Apply","Apply Now","Duration","Detailed","Internship","Interns","Walk","Bond","Detailed"])
 
-def _heuristic_feedback(missing: List[str], resume_text: str, jd_title: str = "") -> str:
+def _clean_skill_token(token: str) -> str:
+    token = re.sub(r'[^A-Za-z0-9\+\#\. ]', '', token).strip()
+    return token
+
+def _filter_skills(raw_skills: List[str]) -> List[str]:
+    cleaned = []
+    for s in raw_skills:
+        s2 = _clean_skill_token(s)
+        if not s2 or s2.lower() in (w.lower() for w in NOISE_TOKENS):
+            continue
+        # drop tokens that are single letters or numbers
+        if len(s2) <= 2:
+            continue
+        cleaned.append(s2)
+    # dedupe preserving order
+    seen = set(); out = []
+    for x in cleaned:
+        if x.lower() not in seen:
+            out.append(x); seen.add(x.lower())
+    return out
+
+def _heuristic_feedback(missing: List[str]) -> str:
+    missing = _filter_skills(missing)
     if not missing:
-        return "Good match — no critical skills missing. Consider adding more domain-specific projects to stand out."
-    bullets = []
+        return "Good match. Consider strengthening measurable results (metrics) and adding 1–2 domain projects."
+    suggestions = []
+    # For each missing skill produce a 1-line actionable advise
     for s in missing[:6]:
-        bullets.append(f"- Add a short project or certification demonstrating **{s}** (small project, 1-2 weeks).")
-    bullets.append("Also highlight measurable outcomes (metrics, links, durations).")
-    return "\n".join(bullets)
+        suggestions.append(f"- Build a 1–2 week mini-project demonstrating {s} (a short repo + README, 3–4 key metrics).")
+    suggestions.append("- Add concise metrics (e.g., latency, accuracy, throughput) and links to code/sample outputs.")
+    return "\n".join(suggestions)
 
+# LLM-based feedback (optional)
 def generate_feedback(resume_text: str, jd_text: str, missing: List[str], jd_title: str = "") -> str:
-    """
-    Use an LLM (if available) to craft 4 concise actionable suggestions.
-    Fallback to heuristic suggestions if LLM/API not available.
-    """
-    if OPENAI_AVAILABLE and os.getenv("OPENAI_API_KEY"):
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        prompt = f"""
-You are a friendly career coach. Given a candidate resume text and the job description, provide 4 short, actionable suggestions (1 sentence each) the candidate can do in 4-8 weeks to improve fit for the job titled '{jd_title}'.
-Mention specific skills from the missing list: {missing}.
-Resume excerpt (first 800 chars):
-{resume_text[:800]}
-
-Return only JSON: {{ "suggestions": ["...", "...", "...", "..."] }}
-"""
-        try:
-            resp = client.responses.create(model="gpt-4o-mini", input=[{"role":"user","content":prompt}], max_output_tokens=300)
-            raw = ""
-            for item in resp.output:
-                if isinstance(item, dict) and item.get("type") == "output_text":
-                    raw += item.get("text","")
-                elif isinstance(item, str):
-                    raw += item
-            import json, re
-            match = re.search(r'(\{.*\})', raw, flags=re.S)
-            if match:
-                parsed = json.loads(match.group(1))
-                sug = parsed.get("suggestions", [])
-                if sug:
-                    return "\n".join([f"- {s}" for s in sug])
-            # fallback to heuristics if parsing failed
-        except Exception:
-            pass
-
-    # fallback
-    return _heuristic_feedback(missing, resume_text, jd_title)
+    # Clean the missing skill tokens first
+    missing_clean = _filter_skills(missing)
+    # if no LLM available or no key, deliver heuristic feedback
+    try:
+        from openai import OpenAI
+        key = os.getenv("OPENAI_API_KEY") or os.getenv("GROQ_API_KEY")
+        if not key:
+            return _heuristic_feedback(missing)
+        client = OpenAI(api_key=key)
+        prompt = f"""You are a concise career coach. Given missing skills {missing_clean} for JD titled '{jd_title}', produce 4 short, concrete suggestions (1 sentence each) the candidate can accomplish in 2-6 weeks. Output plain text bullets only."""
+        resp = client.responses.create(model="gpt-4o-mini", input=[{"role":"user","content":prompt}], max_output_tokens=200)
+        out = ""
+        for item in resp.output:
+            if isinstance(item, dict) and item.get("type") == "output_text":
+                out += item.get("text","")
+            elif isinstance(item, str):
+                out += item
+        # fallback to heuristic if response empty
+        if not out.strip():
+            return _heuristic_feedback(missing_clean)
+        return out.strip()
+    except Exception:
+        return _heuristic_feedback(missing)
