@@ -1,3 +1,28 @@
+CSS = """
+<style>
+    .stApp, .main {
+        background-color: #0b0b0d;
+        color: #e6e6e6;
+    }
+    .stButton>button { background-color: #111; color: #fff; border-radius:8px; }
+    .title { font-family: 'Helvetica', sans-serif; color:#FFD700; font-weight:700; font-size:28px; }
+    .card { background: linear-gradient(90deg, rgba(0,0,0,0.85), rgba(20,20,20,0.85)); border-radius:12px; padding:12px; margin-bottom:12px; box-shadow: 0 2px 6px rgba(0,0,0,0.5); }
+    .chip { padding:6px 10px; border-radius:999px; color:#fff; font-weight:700; display:inline-block; }
+    .chip-high { background: linear-gradient(90deg,#00b894,#00cec9); }
+    .chip-medium { background: linear-gradient(90deg,#ffeaa7,#fab1a0); color:#1b1b1b; }
+    .chip-low { background: linear-gradient(90deg,#ff7675,#d63031); }
+    .tag { display:inline-block; padding:4px 8px; border-radius:6px; background:#111; margin:2px; color:#fff; border:1px solid #222;}
+    .small { font-size:12px; color:#9aa0a6; }
+
+    /* Make headings yellow */
+    h1, h2, h3, h4, h5, h6 {
+        color: #FFD700;
+        font-weight: 700;
+    }
+</style>
+"""
+
+
 # dashboard/streamlit_app.py
 import sys, os, re, tempfile
 import streamlit as st
