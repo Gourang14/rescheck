@@ -25,3 +25,4 @@ pytest>=7.4.0
 rapidfuzz>=3.0.0
 google-genai
 PyPDF2
+docx
