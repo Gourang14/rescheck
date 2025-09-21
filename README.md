@@ -15,7 +15,7 @@ This project is part of **Theme 2 — Automated Resume Relevance Check System (I
   - **Soft Match**: semantic similarity via embeddings.
 - Outputs:
   - Final **Relevance Score** (0–100).
-  - Verdict: High / ⚠Medium / Low.
+  - Verdict: High / Medium / Low.
   - Missing Skills.
   - Actionable Feedback.
 - Dashboard for placement team:
