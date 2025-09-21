@@ -52,3 +52,5 @@ pip install -r requirements.txt
 [![Python](https://img.shields.io/badge/Python-3.11-blue.svg)](https://www.python.org/)  
 [![FastAPI](https://img.shields.io/badge/FastAPI-Backend-brightgreen.svg)](https://fastapi.tiangolo.com/)  
 [![Streamlit](https://img.shields.io/badge/Streamlit-Frontend-ff4b4b.svg)](https://streamlit.io/)  
+
+https://rescheck-dg9pxsukuzrznexktcy3a6.streamlit.app/
