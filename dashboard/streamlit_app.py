@@ -108,136 +108,59 @@ else:
 scorer = Scorer(weights={"hard": hard_weight, "soft": soft_weight})
 
 # --- JD Upload ---
-st.markdown("## Upload Job Description")
-jd_file = st.file_uploader("Upload JD (PDF / DOCX / TXT)", type=["pdf", "docx", "txt"])
-jd_text = ""
+# inside dashboard/streamlit_app.py — JD upload block (replace existing JD upload UI)
+import streamlit as st, requests, tempfile, os, traceback
+
+st.sidebar.header("Groq settings")
+groq_url = st.sidebar.text_input("Groq API URL (full endpoint)", value=os.getenv("GROQ_API_URL",""))
+groq_key = st.sidebar.text_input("Groq API Key (optional)", type="password")
+use_groq = st.sidebar.checkbox("Use Groq for JD parsing", value=True)
+
+API_BASE = st.sidebar.text_input("Backend API", value=os.getenv("API_BASE","http://localhost:8000"))
+
+st.header("Upload Job Description (JD)")
+jd_file = st.file_uploader("JD (pdf/docx/txt)", type=["pdf","docx","txt"])
 if jd_file:
-    tmp_jd = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(jd_file.name)[1])
-    tmp_jd.write(jd_file.getbuffer())
-    tmp_jd.close()
+    raw_bytes = jd_file.read()
+    st.subheader("Preview (first 800 chars)")
     try:
-        if jd_file.name.lower().endswith(".pdf"):
-            jd_text = extract_text_from_pdf(tmp_jd.name)
-        elif jd_file.name.lower().endswith(".docx"):
-            jd_text = extract_text_from_docx(tmp_jd.name)
-        else:
-            jd_text = open(tmp_jd.name, "r", encoding="utf-8", errors="ignore").read()
-    except Exception as e:
-        st.error(f"Failed to extract JD text: {e}")
-        jd_text = ""
-
-if jd_text:
-    st.markdown("**JD preview (first 800 chars)**")
-    st.code(jd_text[:800] + ("..." if len(jd_text) > 800 else ""))
-
-    jd_sections = section_split(jd_text)
-
-    # --- Auto-skill extraction ---
-    candidates = re.findall(r'\b[A-Z][a-zA-Z0-9\+\#\.]{2,}\b', jd_text)
-    candidates = list(dict.fromkeys(candidates))  # dedupe
-    auto_skills = candidates[:25]
-
-    st.markdown("### Skills (auto-detected — edit if needed)")
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        must_text = st.text_area("Must-have skills (comma separated)", value=",".join(auto_skills), height=120)
-        nice_text = st.text_area("Nice-to-have skills (comma separated)", value="", height=80)
-    with col2:
-        st.markdown("**Quick actions**")
-        if st.button("Use auto-detected skills"):
-            st.session_state["must_text"] = ",".join(auto_skills)
-            st.experimental_rerun()
-        st.markdown("**Embedding provider**")
-        st.write(f"Using: **{type(emb_provider).__name__}**")
-
-    must_have = [s.strip() for s in (st.session_state.get("must_text", must_text) or "").split(",") if s.strip()]
-    nice_to_have = [s.strip() for s in (nice_text or "").split(",") if s.strip()]
-else:
-    st.info("Please upload a Job Description to enable resume evaluation.")
-    must_have, nice_to_have = [], []
-
-st.markdown("---")
-
-# --- Resume Upload ---
-st.markdown("## Upload Resumes")
-uploaded = st.file_uploader("Upload Resumes (PDF/DOCX) — multiple allowed", accept_multiple_files=True, type=["pdf", "docx"])
-
-if uploaded and not jd_text:
-    st.warning("Upload a Job Description first.")
-if uploaded and jd_text:
-    st.info(f"Processing {len(uploaded)} resumes...")
-    progress = st.progress(0)
-    results, failed = [], []
-    total = len(uploaded)
-
-    for idx, f in enumerate(uploaded, start=1):
-        status_placeholder = st.empty()
-        status_placeholder.info(f"Parsing {f.name} ({idx}/{total})...")
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(f.name)[1])
-        tmp.write(f.getbuffer())
-        tmp.close()
-
+        # try to show text quickly
+        import tempfile, os
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix="." + jd_file.name.split(".")[-1])
+        tmp.write(raw_bytes); tmp.close()
+        from backend.services.parser import extract_text
+        txt = extract_text(tmp.name)
+        os.unlink(tmp.name)
+    except Exception:
         try:
-            text = extract_resume_text(tmp.name)
+            txt = raw_bytes.decode("utf-8", errors="ignore")
+        except:
+            txt = "<binary content>"
+    st.code(txt[:800])
+
+    if st.button("Upload JD to backend (use Groq)"):
+        files = {"file": (jd_file.name, raw_bytes)}
+        data = {"use_groq": str(bool(use_groq)).lower()}
+        if groq_url:
+            data["model_url"] = groq_url
+        if groq_key:
+            data["api_key"] = groq_key
+        try:
+            resp = requests.post(f"{API_BASE}/jd/upload", files=files, data=data, timeout=120)
+            resp.raise_for_status()
+            out = resp.json()
+            st.success(f"JD uploaded (job_id={out['job_id']})")
+            st.subheader("Parsed JD")
+            st.json(out["parsed"])
+            st.session_state["job_id"] = out["job_id"]
         except Exception as e:
-            status_placeholder.error(f"Failed to parse {f.name}: {e}")
-            failed.append({"filename": f.name, "error": str(e)})
-            progress.progress(int((idx / total) * 100))
-            continue
-
-        sections = section_split(text)
-        with st.expander(f"Preview parsed sections — {f.name}", expanded=False):
-            for k, v in sections.items():
-                st.markdown(f"**{k.title()}**")
-                st.code(v[:800] + ("..." if len(v) > 800 else ""))
-
-        # scoring
-        try:
-            hard = scorer.hard_score(text, must_have, nice_to_have)
-        except Exception as e:
-            hard = 0.0
-            st.warning(f"Hard scoring failed for {f.name}: {e}")
-
-        try:
-            jd_vec = emb_provider.embed([jd_text])[0]
-            resume_vec = emb_provider.embed([text])[0]
-            soft = scorer.soft_score(jd_vec, resume_vec)
-        except Exception as e:
-            st.warning(f"Soft score failed for {f.name}: {e}")
-            soft = 0.0
-
-        final = scorer.final_score(hard, soft)
-        verdict = scorer.verdict(final)
-
-        # missing skills
-        try:
-            skill_map = extract_skills(text, must_have)
-            matched = {k for k, v in skill_map.items() if v >= 70}
-            missing = [k for k in must_have if k not in matched]
-        except Exception:
-            matched, missing = set(), must_have.copy()
-
-        # feedback
-        feedback_text = "Feedback disabled (no API key or LLM disabled)."
-        if use_groq and st.session_state.get("api_key"):
-            os.environ["GROQ_API_KEY"] = st.session_state["api_key"]
+            st.error("JD upload/parsing failed. See error below.")
+            st.text(str(e))
             try:
-                feedback_text = generate_feedback(text, jd_text, missing)[:3000]
-            except Exception as e:
-                feedback_text = f"Feedback generation failed: {e}"
+                st.text(resp.text[:2000])
+            except:
+                st.text(traceback.format_exc())
 
-        results.append({
-            "filename": f.name,
-            "score": round(final, 2),
-            "verdict": verdict,
-            "hard": round(hard, 2),
-            "soft": round(soft, 2),
-            "missing": missing,
-            "feedback": feedback_text
-        })
-
-        progress.progress(int((idx / total) * 100))
-        status_placeholder.success(f"Processed {f.name}: score {final:.1f} — {verdict}")
 
     # --- Results ---
     st.markdown("## Results")
