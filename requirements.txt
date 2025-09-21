@@ -23,3 +23,4 @@ groq>=0.4.2
 # Testing
 pytest>=7.4.0
 rapidfuzz>=3.0.0
+google-genai
