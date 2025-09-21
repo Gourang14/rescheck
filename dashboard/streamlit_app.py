@@ -1,425 +1,267 @@
 # dashboard/streamlit_app.py
 """
-Streamlit app: JD upload + resume upload + automatic LLM endpoint discovery.
-You only provide an API key (and optionally choose provider). The app will:
- - try known Groq endpoints automatically (no URL input required)
- - optionally use OpenAI if chosen or key looks like `sk-...`
- - fallback to local heuristic parser/scorer if remote calls fail
+Streamlit app that:
+ - Uploads a Job Description (PDF/DOCX/TXT)
+ - Forces parsing via Groq LLM by sending model_url + api_key to backend /jd/upload
+ - Uploads resumes, then calls backend /evaluate (and passes groq creds so evaluator uses Groq)
+ - Shows parsed JD JSON, evaluation results, missing skills, feedback, and raw groq output on failure
 
 Notes:
- - This runs entirely client-side (Streamlit process). Do not paste production keys on shared machines.
- - If you're behind a corporate proxy, set HTTP(S)_PROXY env vars before launching Streamlit.
+ - Make sure your backend (FastAPI app) is running and its /jd/upload and /evaluate endpoints accept
+   model_url and api_key form fields (this app assumes that).
+ - Use Streamlit sidebar to enter Groq URL and API key (temporary for testing).
 """
 
-import os, re, json, tempfile, traceback
-from typing import Optional, Dict, Any, List
+import os
+import tempfile
+import json
 import requests
+import traceback
 import streamlit as st
 
-# Optional: better file parsing
-try:
-    import fitz  # PyMuPDF
-    _HAS_FITZ = True
-except Exception:
-    _HAS_FITZ = False
-
-try:
-    import docx2txt
-    _HAS_DOCX2TXT = True
-except Exception:
-    _HAS_DOCX2TXT = False
-
-try:
-    from rapidfuzz import fuzz
-    _HAS_RAPIDFUZZ = True
-except Exception:
-    _HAS_RAPIDFUZZ = False
-
-st.set_page_config(layout="wide", page_title="Resume Relevance — Auto Endpoint (Groq/OpenAI)")
-st.title("Resume Relevance — Auto Endpoint (Groq/OpenAI)")
+st.set_page_config(page_title="Resume Relevance — Groq JD parsing", layout="wide")
+st.title("Resume Relevance — Groq JD parsing (Llama-38B)")
 
 # -------------------------
-# Candidate Groq endpoints (we'll try these automatically)
+# Configurable endpoints
 # -------------------------
-GROQ_CANDIDATE_URLS = [
-    "https://api.groq.ai/v1/models/llama-38b/generate",
-    "https://api.groq.ai/v1/engines/llama-38b/completions",
-    "https://api.groq.ai/v1/models/llama-3-8b/generate",
-    # vendor partner endpoints could be added here if you have them
-]
+DEFAULT_BACKEND = os.getenv("API_BASE", "http://localhost:8000")
+API_BASE = st.sidebar.text_input("Backend API base URL", value=DEFAULT_BACKEND)
+st.sidebar.markdown("**Groq (LLM) settings** — for parsing & evaluation")
+
+groq_url = st.sidebar.text_input("Groq API URL (full endpoint)", value=os.getenv("GROQ_API_URL", ""))
+groq_key = st.sidebar.text_input("Groq API Key", value=os.getenv("GROQ_API_KEY", ""), type="password")
+use_groq_checkbox = st.sidebar.checkbox("Use Groq for JD parsing & evaluation (send creds to backend)", value=True)
+
+st.sidebar.markdown("---")
+st.sidebar.write("Tips:")
+st.sidebar.write("- If Groq returns non-JSON, the backend will fallback to heuristic and return `parse_error` with raw response.")
+st.sidebar.write("- For production, set env vars in server instead of sending keys from UI.")
 
 # -------------------------
-# Helpers: file extraction
+# Helpers
 # -------------------------
-def extract_text_from_bytes(b: bytes, filename: str) -> str:
-    lower = filename.lower()
-    if lower.endswith(".pdf"):
-        return _extract_pdf_bytes(b)
-    if lower.endswith(".docx"):
-        return _extract_docx_bytes(b)
-    try:
-        return b.decode("utf-8", errors="ignore")
-    except:
-        return ""
+def show_exception(e):
+    st.error("Error: " + str(e))
+    st.text(traceback.format_exc())
 
-def _extract_pdf_bytes(b: bytes) -> str:
-    if _HAS_FITZ:
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
-        tmp.write(b); tmp.close()
-        try:
-            doc = fitz.open(tmp.name)
-            pages = [p.get_text() for p in doc]
-            doc.close()
-            return "\n".join(pages)
-        finally:
-            try: os.unlink(tmp.name)
-            except: pass
-    try:
-        return b.decode("utf-8", errors="ignore")
-    except:
-        return ""
-
-def _extract_docx_bytes(b: bytes) -> str:
-    if _HAS_DOCX2TXT:
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".docx")
-        tmp.write(b); tmp.close()
-        try:
-            return docx2txt.process(tmp.name) or ""
-        finally:
-            try: os.unlink(tmp.name)
-            except: pass
-    try:
-        return b.decode("utf-8", errors="ignore")
-    except:
-        return ""
-
-# -------------------------
-# JSON extraction helper
-# -------------------------
-def _try_extract_json(text: str) -> Optional[Dict[str, Any]]:
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-    # try find first balanced {...}
-    try:
-        start = text.find("{")
-        if start != -1:
-            depth = 0
-            for i in range(start, len(text)):
-                ch = text[i]
-                if ch == "{": depth += 1
-                elif ch == "}": depth -= 1
-                if depth == 0:
-                    cand = text[start:i+1]
-                    return json.loads(cand)
-    except Exception:
-        pass
-    # regex fallback
-    try:
-        m = re.search(r'(\{(?:[^{}]|\n|\r)*\})', text)
-        if m: return json.loads(m.group(1))
-    except Exception:
-        pass
-    return None
-
-# -------------------------
-# Callers: try Groq candidate endpoints then OpenAI fallback
-# -------------------------
-DEFAULT_TIMEOUT = 40
-
-def try_groq_auto(api_key: str, prompt: str, max_tokens: int = 1024, temperature: float = 0.0) -> Dict[str, Any]:
+def preview_text_from_bytes(b: bytes, fname: str) -> str:
     """
-    Try candidate Groq endpoints in sequence and return dict:
-      { success: bool, url: str|None, raw: str|None, json: dict|None, diagnostics: {...} }
+    Try to provide a text preview from uploaded bytes.
+    For PDFs this will just show a byte-decoded preview (best-effort).
+    The authoritative extract should happen on backend using PyMuPDF/pdfplumber/docx2txt.
     """
-    diagnostics = {"attempts": []}
+    try:
+        return b.decode("utf-8", errors="ignore")[:4000]
+    except Exception:
+        return f"<binary content: {fname} — preview not available>"
+
+def upload_jd_to_backend(file_bytes: bytes, filename: str, title: str = "", use_groq: bool = True, model_url: str = None, api_key: str = None, backend_url: str = API_BASE):
+    """
+    Upload JD file to backend /jd/upload. This passes use_groq + model_url + api_key form fields.
+    Returns JSON response or raises.
+    """
+    files = {"file": (filename, file_bytes)}
+    data = {"use_groq": str(bool(use_groq)).lower()}
+    if title:
+        data["title"] = title
+    if model_url:
+        data["model_url"] = model_url
+    if api_key:
+        data["api_key"] = api_key
+    resp = requests.post(f"{backend_url.rstrip('/')}/jd/upload", files=files, data=data, timeout=120)
+    resp.raise_for_status()
+    return resp.json()
+
+def upload_resume_to_backend(file_bytes: bytes, filename: str, backend_url: str = API_BASE):
+    files = {"file": (filename, file_bytes)}
+    resp = requests.post(f"{backend_url.rstrip('/')}/resume/upload", files=files, timeout=120)
+    resp.raise_for_status()
+    return resp.json()
+
+def evaluate_resume_backend(job_id: int, resume_id: int, hard_weight: float, soft_weight: float, model_url: str = None, api_key: str = None, backend_url: str = API_BASE):
+    data = {
+        "job_id": str(job_id),
+        "resume_id": str(resume_id),
+        "hard_weight": str(hard_weight),
+        "soft_weight": str(soft_weight),
+    }
+    if model_url:
+        data["model_url"] = model_url
+    if api_key:
+        data["api_key"] = api_key
+    resp = requests.post(f"{backend_url.rstrip('/')}/evaluate", data=data, timeout=180)
+    resp.raise_for_status()
+    return resp.json()
+
+# Optional: direct groq test from Streamlit (useful for debugging groq endpoint)
+def groq_direct_test(prompt: str, model_url: str, api_key: str, timeout: int = 30):
+    """
+    Send prompt directly to Groq endpoint from Streamlit for quick testing.
+    Tries common payload shapes (input, prompt, messages). Returns raw text response.
+    """
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "Accept": "application/json"}
     bodies = [
-        {"input": prompt, "max_output_tokens": max_tokens, "temperature": temperature},
-        {"prompt": prompt, "max_tokens": max_tokens, "temperature": temperature},
-        {"messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens, "temperature": temperature}
+        {"input": prompt, "max_output_tokens": 1024, "temperature": 0.0},
+        {"prompt": prompt, "max_tokens": 1024, "temperature": 0.0},
+        {"messages": [{"role": "user", "content": prompt}], "max_tokens": 1024, "temperature": 0.0}
     ]
-    for url in GROQ_CANDIDATE_URLS:
-        for i, body in enumerate(bodies, start=1):
-            attempt = {"url": url, "body_shape": i}
-            try:
-                r = requests.post(url, headers=headers, json=body, timeout=DEFAULT_TIMEOUT)
-                attempt["status"] = r.status_code
-                attempt["ok"] = r.ok
-                attempt["truncated_text"] = r.text[:1500]
-                diagnostics["attempts"].append(attempt)
-                if r.ok:
-                    parsed = _try_extract_json(r.text)
-                    return {"success": True, "url": url, "raw": r.text, "json": parsed, "diagnostics": diagnostics}
-            except Exception as e:
-                attempt["exception"] = repr(e)
-                diagnostics["attempts"].append(attempt)
-                continue
-    return {"success": False, "url": None, "raw": None, "json": None, "diagnostics": diagnostics}
+    last_err = None
+    for body in bodies:
+        try:
+            r = requests.post(model_url, headers=headers, json=body, timeout=timeout)
+            r.raise_for_status()
+            return r.text
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"Direct Groq request failed: {last_err}")
 
-def try_openai_direct(api_key: str, prompt: str, model: str = "gpt-4o-mini", max_tokens: int = 1024, temperature: float = 0.0) -> Dict[str, Any]:
-    """
-    Try OpenAI via the openai REST-compatible endpoint using requests if the openai package is not present.
-    This function will attempt the canonical chat completions response shape.
-    """
-    # first try official OpenAI REST endpoint
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    body = {"model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens, "temperature": temperature}
-    try:
-        r = requests.post(url, headers=headers, json=body, timeout=DEFAULT_TIMEOUT)
-        if r.ok:
-            text = r.text
-            # try parse common shapes: choices[0].message.content or direct text
-            try:
-                js = r.json()
-                content = None
-                if "choices" in js and len(js["choices"])>0:
-                    ch = js["choices"][0]
-                    if isinstance(ch.get("message"), dict):
-                        content = ch["message"].get("content")
-                    elif "text" in ch:
-                        content = ch.get("text")
-                if content is None:
-                    # fallback to raw text
-                    content = json.dumps(js)
-            except Exception:
-                content = r.text
-            parsed = _try_extract_json(content) or _try_extract_json(r.text)
-            return {"success": True, "raw": r.text, "json": parsed, "diagnostics": {"url": url, "status": r.status_code}}
+# -------------------------
+# UI: JD upload & parse
+# -------------------------
+st.header("1) Job Description (JD) — upload & parse (Groq)")
+
+col1, col2 = st.columns([3, 1])
+with col1:
+    jd_file = st.file_uploader("Upload JD (pdf / docx / txt)", type=["pdf", "docx", "txt"])
+    jd_title = st.text_input("Optional job title (sent to backend)", value="")
+with col2:
+    st.write("Groq debug")
+    if st.button("Test Groq endpoint (quick)"):
+        if not groq_url or not groq_key:
+            st.warning("Please provide Groq URL & API key in the sidebar first.")
         else:
-            return {"success": False, "raw": r.text, "json": None, "diagnostics": {"url": url, "status": r.status_code}}
-    except Exception as e:
-        return {"success": False, "raw": None, "json": None, "diagnostics": {"exception": repr(e)}}
-
-# -------------------------
-# Prompts (same as earlier)
-# -------------------------
-JD_PROMPT_TEMPLATE = """
-You are a strict JSON extractor for job descriptions.
-Given this job description below, return a VALID JSON object with keys:
-- title (string)
-- must_have (array of short strings)
-- good_to_have (array of short strings)
-- qualifications (array of short strings)
-- experience (string)
-
-Keep skill names short (1-4 words). Do NOT add extra commentary. Return only JSON.
-
-Job description:
-\"\"\"{jd}\"\"\"
-"""
-
-EVAL_PROMPT_TEMPLATE = """
-You are an objective resume evaluator. Inputs:
-JD_PARSED_JSON:
-{jd_json}
-
-RESUME_TEXT (first 7000 chars):
-\"\"\"{resume_excerpt}\"\"\"
-
-Return ONLY valid JSON with keys:
-- hard (number 0-100)
-- soft (number 0-100)
-- final (number 0-100)
-- verdict (one of "High", "Medium", "Low")
-- missing (object with keys: must (list), good (list))
-- feedback (array of 3-6 short actionable strings)
-
-final should be computed as: final = round(hard_weight*hard + soft_weight*soft, 2)
-Use the provided hard_weight and soft_weight values.
-
-hard_weight: {hard_weight}
-soft_weight: {soft_weight}
-"""
-
-# -------------------------
-# Simple heuristic fallback (same as earlier)
-# -------------------------
-def heuristic_parse_jd(text: str) -> Dict[str, Any]:
-    res = {"title": "", "must_have": [], "good_to_have": [], "qualifications": [], "experience": ""}
-    for line in text.splitlines():
-        if line.strip():
-            res["title"] = line.strip()[:200]; break
-    must = re.findall(r'(?:must[-\s]*have|required)[:\-\s]*([^\n;]+)', text, flags=re.I)
-    good = re.findall(r'(?:nice[-\s]*to[-\s]*have|good[-\s]*to[-\s]*have|preferred)[:\-\s]*([^\n;]+)', text, flags=re.I)
-    quals = re.findall(r'(?:qualification|education|degree|certification)[:\-\s]*([^\n;]+)', text, flags=re.I)
-    def split_and_clean(s): return [p.strip() for p in re.split(r'[,\;/\|]', s) if p.strip()]
-    for m in must: res["must_have"].extend(split_and_clean(m))
-    for g in good: res["good_to_have"].extend(split_and_clean(g))
-    for q in quals: res["qualifications"].extend(split_and_clean(q))
-    exp = re.search(r'(\d+\+?\s+years?|\d+-\d+\s+years)', text, flags=re.I)
-    if exp: res["experience"] = exp.group(0)
-    if not res["must_have"]:
-        tokens = re.findall(r'\b[A-Za-z\+\#]{2,}(?:\s+[A-Za-z\+\#]{2,}){0,2}\b', text)
-        noise = {"our","we","the","and","or","to","in","with","from","that","this","apply","role","job"}
-        out=[]; seen=set()
-        for t in tokens:
-            tl = t.lower()
-            if tl in noise or len(t) <= 2: continue
-            if tl in seen: continue
-            seen.add(tl); out.append(t)
-            if len(out)>=12: break
-        res["must_have"].extend(out)
-    return res
-
-def heuristic_score(resume_text: str, jd_parsed: Dict[str, Any], hard_weight=0.6, soft_weight=0.4) -> Dict[str, Any]:
-    must = jd_parsed.get("must_have", [])
-    good = jd_parsed.get("good_to_have", [])
-    found_must=[]; found_good=[]
-    if _HAS_RAPIDFUZZ:
-        for s in must:
-            if fuzz.partial_ratio(s.lower(), resume_text.lower()) >= 70: found_must.append(s)
-        for s in good:
-            if fuzz.partial_ratio(s.lower(), resume_text.lower()) >= 70: found_good.append(s)
-    else:
-        for s in must:
-            if s.lower() in resume_text.lower(): found_must.append(s)
-        for s in good:
-            if s.lower() in resume_text.lower(): found_good.append(s)
-    must_cov = (len(found_must)/len(must)) if must else 1.0
-    good_cov = (len(found_good)/len(good)) if good else 1.0
-    hard = round((0.75*must_cov + 0.25*good_cov)*100,2)
-    soft = round(hard * 0.9,2)
-    final = round(hard_weight*hard + soft_weight*soft,2)
-    verdict = "High" if final >= 75 else "Medium" if final >= 50 else "Low"
-    missing = {"must":[m for m in must if m not in found_must], "good":[g for g in good if g not in found_good]}
-    feedback = [f"Add a short project/cert demonstrating: {m}" for m in missing["must"][:4]]
-    return {"hard": hard, "soft": soft, "final": final, "verdict": verdict, "missing": missing, "feedback": feedback}
-
-# -------------------------
-# UI
-# -------------------------
-st.sidebar.header("API Key / Provider")
-api_key = st.sidebar.text_input("API Key (required for remote parsing)", type="password")
-provider = st.sidebar.selectbox("Provider (auto tries Groq first)", ["Auto (Groq then OpenAI)", "Groq only", "OpenAI only"])
-st.sidebar.markdown("If you don't have an API key, you can use the local heuristic parser.")
-
-st.header("1) Job Description (JD) upload or paste")
-jd_file = st.file_uploader("Upload JD (PDF/DOCX/TXT) or paste below", type=["pdf","docx","txt"])
-jd_text = st.text_area("Or paste JD text here", height=220)
+            with st.spinner("Calling Groq directly..."):
+                try:
+                    test_prompt = "Return a JSON object: { 'hello': 'world' }"
+                    resp_text = groq_direct_test(test_prompt, groq_url, groq_key)
+                    st.success("Groq responded (truncated):")
+                    st.code(resp_text[:2000])
+                except Exception as e:
+                    show_exception(e)
 
 if jd_file:
-    try:
-        jd_text = extract_text_from_bytes(jd_file.read(), jd_file.name)
-    except Exception as e:
-        st.error("Failed to read JD file: " + str(e))
-
-if not jd_text.strip():
-    st.info("Upload or paste a JD to proceed (or use heuristic parser).")
-
-col1, col2 = st.columns([2,1])
-with col1:
-    parse_btn = st.button("Parse JD (auto)")
-with col2:
-    clear_btn = st.button("Clear parsed JD")
-
-if clear_btn:
-    st.session_state.pop("parsed_jd", None)
-    st.success("Cleared parsed JD.")
-
-if parse_btn:
-    if not api_key and (provider != "OpenAI only"):
-        st.warning("No API key provided — using local heuristic parser.")
-        parsed = heuristic_parse_jd(jd_text)
-        st.session_state["parsed_jd"] = parsed
-        st.json(parsed)
-    else:
-        st.info("Attempting remote parse (auto-discovery). This will try candidate endpoints automatically.")
-        parsed = None
-        diagnostics = {}
-        # Try flows depending on provider selection
-        if provider in ("Auto (Groq then OpenAI)", "Groq only", "Auto (Groq then OpenAI)"):
-            g = try_groq_auto(api_key, JD_PROMPT_TEMPLATE.format(jd=jd_text), max_tokens=800, temperature=0.0)
-            diagnostics["groq_try"] = g["diagnostics"]
-            if g["success"]:
-                parsed = g["json"] or heuristic_parse_jd(jd_text)
-                parsed["_remote_url"] = g["url"]
-                parsed["_remote_raw_trunc"] = (g["raw"][:1500] if g.get("raw") else None)
-        if parsed is None and provider in ("Auto (Groq then OpenAI)","OpenAI only"):
-            o = try_openai_direct(api_key, JD_PROMPT_TEMPLATE.format(jd=jd_text), model="gpt-4o-mini", max_tokens=800, temperature=0.0)
-            diagnostics["openai_try"] = o["diagnostics"]
-            if o["success"]:
-                parsed = o["json"] or heuristic_parse_jd(jd_text)
-                # store raw
-                parsed["_remote_url"] = o["diagnostics"].get("url")
-                parsed["_remote_raw_trunc"] = (o.get("raw")[:1500] if o.get("raw") else None)
-
-        if parsed:
-            st.success("Parsed JD (remote or fallback):")
-            st.json(parsed)
-            st.session_state["parsed_jd"] = parsed
-            if diagnostics:
-                with st.expander("Diagnostics (which endpoints tried)"):
-                    st.json(diagnostics)
-        else:
-            st.error("Remote parsing failed for all attempted endpoints — using local heuristic fallback.")
-            parsed = heuristic_parse_jd(jd_text)
-            parsed["parse_fallback_reason"] = "remote_failed"
-            st.json(parsed)
-            st.session_state["parsed_jd"] = parsed
+    jd_bytes = jd_file.read()
+    st.subheader("Preview (first 1200 chars)")
+    st.code(preview_text_from_bytes(jd_bytes, jd_file.name)[:1200])
+    st.write("")
+    parse_col, fallback_col = st.columns(2)
+    with parse_col:
+        if st.button("Parse JD (Groq)"):
+            if not use_groq_checkbox:
+                st.warning("Groq usage is disabled in the UI. Toggle 'Use Groq' in the sidebar if you want to use Groq.")
+            else:
+                st.info("Uploading JD to backend and requesting Groq-based parse...")
+                try:
+                    out = upload_jd_to_backend(jd_bytes, jd_file.name, title=jd_title, use_groq=True, model_url=groq_url or None, api_key=groq_key or None, backend_url=API_BASE)
+                    st.success("JD uploaded and parsed — backend response:")
+                    st.json(out.get("parsed", out))
+                    # store job_id for later evaluation
+                    job_id = out.get("job_id")
+                    if job_id:
+                        st.session_state["job_id"] = job_id
+                        st.info(f"Saved job_id {job_id} to session.")
+                except Exception as e:
+                    st.error("JD parse/upload failed. Backend responded with an error — falling back to local heuristic parse (display only).")
+                    show_exception(e)
+                    # optional: call local heuristic parse (if available in same env)
+                    try:
+                        from backend.services.jd_parser import parse_jd as local_parse
+                        parsed_local = local_parse(jd_bytes.decode("utf-8", errors="ignore"), use_groq=False)
+                        st.subheader("Local heuristic parse result (fallback)")
+                        st.json(parsed_local)
+                    except Exception:
+                        st.warning("Local heuristic parser not available in this Streamlit environment.")
+    with fallback_col:
+        if st.button("Parse JD (Local heuristic)"):
+            try:
+                # Try to call local heuristic if backend.services present (works when streamlit runs in same env)
+                from backend.services.jd_parser import parse_jd as local_parse
+                parsed_local = local_parse(preview_text_from_bytes(jd_bytes, jd_file.name), use_groq=False)
+                st.json(parsed_local)
+            except Exception as e:
+                st.warning("Local parse not available here. Upload JD to backend instead.")
+                show_exception(e)
 
 # -------------------------
-# Resumes upload & evaluate
+# UI: Resumes upload & evaluate
 # -------------------------
-st.header("2) Upload resumes and evaluate (multiple)")
-resume_files = st.file_uploader("Upload resumes (PDF/DOCX/TXT). Select multiple", accept_multiple_files=True, type=["pdf","docx","txt"])
+st.header("2) Upload resumes and evaluate against uploaded JD")
+
+resume_files = st.file_uploader("Upload resumes (multiple). After upload, click Evaluate.", accept_multiple_files=True, type=["pdf", "docx", "txt"])
 hard_weight = st.slider("Hard match weight", min_value=0.0, max_value=1.0, value=0.6, step=0.05)
 soft_weight = round(1.0 - hard_weight, 2)
+st.write(f"Soft weight = {soft_weight}")
 
-if st.button("Evaluate resumes"):
-    if "parsed_jd" not in st.session_state:
-        st.error("No parsed JD found. Parse a JD first.")
-    elif not resume_files:
-        st.error("Upload at least one resume.")
+if st.button("Upload resumes & evaluate (backend)"):
+    if "job_id" not in st.session_state:
+        st.error("No job_id in session. Upload & parse a JD first (Parse JD (Groq)).")
     else:
-        jd_parsed = st.session_state["parsed_jd"]
+        job_id = int(st.session_state["job_id"])
         results = []
         for f in resume_files:
             try:
-                txt = extract_text_from_bytes(f.read(), f.name)
-                # Try remote eval if api_key present
-                eval_result = None
-                diag_eval = {}
-                if api_key and provider != "Groq only":  # allow auto/openai flows
-                    # prefer groq auto
-                    g = try_groq_auto(api_key, EVAL_PROMPT_TEMPLATE.format(jd_json=json.dumps(jd_parsed, ensure_ascii=False), resume_excerpt=txt[:7000], hard_weight=hard_weight, soft_weight=soft_weight), max_tokens=1000, temperature=0.0)
-                    diag_eval["groq_try"] = g["diagnostics"]
-                    if g["success"] and g.get("json"):
-                        eval_result = g["json"]
-                        eval_result["_remote_url"] = g["url"]
-                    else:
-                        o = try_openai_direct(api_key, EVAL_PROMPT_TEMPLATE.format(jd_json=json.dumps(jd_parsed, ensure_ascii=False), resume_excerpt=txt[:7000], hard_weight=hard_weight, soft_weight=soft_weight), model="gpt-4o-mini", max_tokens=1000, temperature=0.0)
-                        diag_eval["openai_try"] = o["diagnostics"]
-                        if o["success"] and o.get("json"):
-                            eval_result = o["json"]
-                            eval_result["_remote_url"] = o["diagnostics"].get("url")
-                # If remote not used or failed -> heuristic
-                if not eval_result:
-                    eval_result = heuristic_score(txt, jd_parsed, hard_weight, soft_weight)
-                    eval_result["_eval_fallback"] = True
-                results.append({"file": f.name, "result": eval_result, "diag": diag_eval})
+                st.info(f"Uploading {f.name} ...")
+                b = f.read()
+                r_up = upload_resume_to_backend(b, f.name, backend_url=API_BASE)
+                resume_id = r_up.get("resume_id")
+                st.success(f"Uploaded {f.name} (resume_id={resume_id}). Evaluating...")
+                # call evaluate - pass groq creds to ensure evaluator uses Groq
+                eval_out = evaluate_resume_backend(job_id, resume_id, hard_weight, soft_weight, model_url=groq_url or None, api_key=groq_key or None, backend_url=API_BASE)
+                results.append({"filename": f.name, "result": eval_out.get("result", eval_out)})
             except Exception as e:
-                st.error(f"Failed for {f.name}: {e}")
+                st.error(f"Failed {f.name}: {e}")
                 st.text(traceback.format_exc())
-        # show results sorted by final score
-        results = sorted(results, key=lambda x: x["result"].get("final", 0), reverse=True)
-        for r in results:
-            res = r["result"]
-            st.subheader(f"{r['file']} — Final: {res.get('final','N/A')}  Verdict: {res.get('verdict','N/A')}")
-            st.write("Hard:", res.get("hard"), "Soft:", res.get("soft"))
-            missing = res.get("missing", {})
-            st.write("Missing (must):", missing.get("must", []))
-            st.write("Missing (good):", missing.get("good", []))
-            fb = res.get("feedback", [])
-            if fb:
-                st.write("Feedback:")
-                for item in fb[:6]:
-                    st.markdown(f"- {item}")
-            if r["diag"]:
-                with st.expander("Diagnostics for this resume (endpoints tried)"):
-                    st.json(r["diag"])
 
+        if results:
+            # sort by final score
+            results = sorted(results, key=lambda x: x["result"].get("final", 0), reverse=True)
+            st.header("Evaluation results (sorted by final score)")
+            for r in results:
+                res = r["result"]
+                st.subheader(f"{r['filename']} — Score: {res.get('final', 'N/A')}  Verdict: {res.get('verdict','N/A')}")
+                st.write("Hard:", res.get("hard"), "Soft:", res.get("soft"))
+                missing = res.get("missing", {})
+                st.write("Missing (must):", missing.get("must", []))
+                st.write("Missing (good):", missing.get("good", []))
+                fb = res.get("feedback", [])
+                if fb:
+                    st.write("Feedback:")
+                    for item in fb[:6]:
+                        st.markdown(f"- {item}")
+                # show raw groq response if present (debugging)
+                if isinstance(res.get("raw_groq_response"), str):
+                    with st.expander("Raw Groq response (debug)"):
+                        st.code(res.get("raw_groq_response")[:4000])
+
+# -------------------------
+# UI: View results stored in backend
+# -------------------------
+st.header("3) View stored evaluations (backend)")
+
+job_id_input = st.number_input("Job ID to fetch results", min_value=0, step=1, value=int(st.session_state.get("job_id", 0)))
+if st.button("Fetch results for job"):
+    try:
+        r = requests.get(f"{API_BASE.rstrip('/')}/results/{int(job_id_input)}", timeout=60)
+        r.raise_for_status()
+        out = r.json()
+        st.json(out)
+    except Exception as e:
+        show_exception(e)
+
+# -------------------------
+# Footer / debug helpers
+# -------------------------
 st.markdown("---")
-st.caption("This app auto-discovers endpoints (Groq candidate URLs) — you only provide an API key. If remote calls fail, a local heuristic is used.")
+st.markdown("**Debug helpers**")
+if st.checkbox("Show environment vars (debug)"):
+    env_preview = {
+        "API_BASE": API_BASE,
+        "GROQ_API_URL (sidebar)": groq_url,
+        "GROQ_API_KEY (sidebar set?)": bool(groq_key),
+        "Use Groq (checkbox)": use_groq_checkbox
+    }
+    st.json(env_preview)
+
+st.caption("If Groq parsing fails return contains parse_error/groq_raw or groq_exception keys. Copy raw to adjust groq_client payload shapes in backend.")
