@@ -1,16 +1,12 @@
 # dashboard/streamlit_app.py
 """
-Streamlit app — Groq-powered resume relevance checker (single-file).
-Usage:
-  - Provide GROQ_API_URL and GROQ_API_KEY in the sidebar (or set env vars first).
-  - Upload a Job Description (PDF/DOCX/TXT) or paste text.
-  - Click "Parse JD (Groq)" to get structured JSON.
-  - Upload multiple resumes and click "Evaluate resumes" to get scores & feedback.
-
-Notes:
-  - This calls your Groq endpoint directly from Streamlit.
-  - Prompts request STRICT JSON; responses are parsed and validated.
-  - Fallback: local heuristic parsing/scoring if Groq is unavailable.
+Resume Relevance — Auto Groq usage (you only provide API key).
+Behavior:
+ - You paste API key (Groq or OpenAI) in the sidebar.
+ - App auto-tries Groq candidate endpoints & request shapes.
+ - If Groq fails, app will automatically try OpenAI (if key looks like sk- or user chooses).
+ - If remote calls fail, app falls back to local heuristic parsing & scoring.
+ - Upload JD (PDF/DOCX/TXT) and multiple resumes; get parsed JD, scores, verdict, and feedback.
 """
 
 import os, re, json, tempfile, time, traceback
@@ -18,7 +14,7 @@ from typing import Optional, Dict, Any, List
 import requests
 import streamlit as st
 
-# Optional file parsers (install if you want improved extraction)
+# Optional libs for better extraction / fuzzy matching
 try:
     import fitz  # PyMuPDF
     _HAS_FITZ = True
@@ -31,45 +27,24 @@ try:
 except Exception:
     _HAS_DOCX2TXT = False
 
-# Optional speedups for fuzzy matching
 try:
     from rapidfuzz import fuzz
     _HAS_RAPIDFUZZ = True
 except Exception:
     _HAS_RAPIDFUZZ = False
 
-# Optional sentence transformer for a local soft score fallback (if installed)
-try:
-    from sentence_transformers import SentenceTransformer
-    import numpy as np
-    _HAS_SBERT = True
-    _SBERT_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
-except Exception:
-    _HAS_SBERT = False
+# Candidate Groq endpoints the app will try automatically (no endpoint required from user)
+GROQ_CANDIDATES = [
+    "https://api.groq.ai/v1/models/llama-38b/generate",
+    "https://api.groq.ai/v1/models/llama-3-8b/generate",
+    "https://api.groq.ai/v1/engines/llama-38b/completions",
+    # add other common shapes if you have provider-specific endpoints
+]
+
+DEFAULT_TIMEOUT = 40
 
 # -------------------------
-# Config / cache
-# -------------------------
-CACHE_FILE = "groq_rescheck_cache.json"
-
-def load_cache():
-    try:
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"jd": {}, "resumes": {}}
-
-def save_cache(cache):
-    try:
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(cache, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-CACHE = load_cache()
-
-# -------------------------
-# Utility: file text extraction
+# Helpers: file extraction
 # -------------------------
 def extract_text_from_bytes(b: bytes, filename: str) -> str:
     name = filename.lower()
@@ -79,7 +54,7 @@ def extract_text_from_bytes(b: bytes, filename: str) -> str:
         return _extract_docx_bytes(b)
     try:
         return b.decode("utf-8", errors="ignore")
-    except Exception:
+    except:
         return ""
 
 def _extract_pdf_bytes(b: bytes) -> str:
@@ -104,8 +79,8 @@ def _extract_docx_bytes(b: bytes) -> str:
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".docx")
         tmp.write(b); tmp.close()
         try:
-            text = docx2txt.process(tmp.name) or ""
-            return text
+            txt = docx2txt.process(tmp.name) or ""
+            return txt
         finally:
             try: os.unlink(tmp.name)
             except: pass
@@ -115,17 +90,14 @@ def _extract_docx_bytes(b: bytes) -> str:
         return ""
 
 # -------------------------
-# Groq client (robust): tries several payload shapes
+# JSON extraction helper
 # -------------------------
-DEFAULT_TIMEOUT = 60
-
-def _extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
-    # direct parse
+def _try_extract_json(text: str) -> Optional[Dict[str, Any]]:
     try:
         return json.loads(text)
     except Exception:
         pass
-    # balanced-brace extraction
+    # find first balanced {...}
     try:
         start = text.find("{")
         if start != -1:
@@ -148,123 +120,148 @@ def _extract_json_from_text(text: str) -> Optional[Dict[str, Any]]:
         pass
     return None
 
-def call_groq_endpoint(prompt: str, groq_url: str, groq_key: str, max_tokens: int = 1024, temperature: float = 0.0) -> Dict[str, Any]:
+# -------------------------
+# Auto-call: tries candidate endpoints + payload shapes
+# -------------------------
+def try_remote_with_key(api_key: str, prompt: str, candidate_urls: List[str], timeout: int = DEFAULT_TIMEOUT, max_tokens=1024) -> Dict[str, Any]:
     """
-    Returns a dict:
-      {
-         success: bool,
-         raw: str or None,
-         parsed_json: dict or None,
-         diagnostics: {...}
-      }
+    Tries candidate endpoints and payload shapes. Returns:
+    { success: bool, url: str|None, parsed: dict|None, raw: str|None, diagnostics: {...} }
     """
-    diagnostics = {"attempts": [], "time": time.time()}
-    headers = {"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json", "Accept": "application/json"}
-    # Try common payload shapes that Groq endpoints often accept
+    diagnostics = {"attempts": []}
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     bodies = [
-        {"input": prompt, "max_output_tokens": max_tokens, "temperature": temperature},
-        {"prompt": prompt, "max_tokens": max_tokens, "temperature": temperature},
-        {"messages": [{"role": "user", "content": prompt}], "max_tokens": max_tokens, "temperature": temperature}
+        {"input": prompt, "max_output_tokens": max_tokens, "temperature": 0.0},
+        {"prompt": prompt, "max_tokens": max_tokens, "temperature": 0.0},
+        {"messages": [{"role":"user", "content": prompt}], "max_tokens": max_tokens, "temperature": 0.0},
     ]
     last_err = None
-    for idx, body in enumerate(bodies, start=1):
-        try:
-            resp = requests.post(groq_url, headers=headers, json=body, timeout=DEFAULT_TIMEOUT)
-            diagnostics["attempts"].append({"shape_idx": idx, "status": resp.status_code, "ok": resp.ok})
-            text = resp.text
-            diagnostics["attempts"][-1]["raw_trunc"] = text[:2000]
-            if resp.ok:
-                parsed = _extract_json_from_text(text)
-                return {"success": True, "raw": text, "parsed_json": parsed, "diagnostics": diagnostics}
-            else:
-                last_err = f"HTTP {resp.status_code}"
-        except Exception as e:
-            last_err = repr(e)
-            diagnostics["attempts"].append({"shape_idx": idx, "exception": repr(e)})
-            continue
+    for url in candidate_urls:
+        for shape_idx, body in enumerate(bodies, start=1):
+            attempt = {"url": url, "shape_idx": shape_idx}
+            try:
+                r = requests.post(url, headers=headers, json=body, timeout=timeout)
+                attempt["status"] = r.status_code
+                attempt["ok"] = r.ok
+                attempt["raw_trunc"] = r.text[:1500]
+                diagnostics["attempts"].append(attempt)
+                if r.ok:
+                    parsed = _try_extract_json(r.text)
+                    return {"success": True, "url": url, "parsed": parsed, "raw": r.text, "diagnostics": diagnostics}
+                else:
+                    last_err = f"HTTP {r.status_code}"
+            except Exception as e:
+                attempt["exception"] = repr(e)
+                diagnostics["attempts"].append(attempt)
+                last_err = repr(e)
+                continue
     diagnostics["last_error"] = last_err
-    return {"success": False, "raw": None, "parsed_json": None, "diagnostics": diagnostics}
+    return {"success": False, "url": None, "parsed": None, "raw": None, "diagnostics": diagnostics}
 
 # -------------------------
-# Prompts (strict JSON output)
+# Plain OpenAI direct attempt (fallback)
 # -------------------------
-JD_PROMPT = """You are a JSON extractor. Given the job description below, return ONLY a valid JSON object with keys:
+def try_openai_direct(api_key: str, prompt: str, timeout: int = DEFAULT_TIMEOUT, model="gpt-4o-mini", max_tokens=1024) -> Dict[str, Any]:
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    body = {"model": model, "messages":[{"role":"user","content":prompt}], "max_tokens": max_tokens, "temperature": 0.0}
+    url = "https://api.openai.com/v1/chat/completions"
+    try:
+        r = requests.post(url, headers=headers, json=body, timeout=timeout)
+        diag = {"status": r.status_code, "url": url}
+        if r.ok:
+            try:
+                js = r.json()
+                # try to find content
+                content = None
+                if "choices" in js and len(js["choices"]) > 0:
+                    ch = js["choices"][0]
+                    if isinstance(ch.get("message"), dict):
+                        content = ch["message"].get("content")
+                    elif "text" in ch:
+                        content = ch.get("text")
+                if content is None:
+                    content = r.text
+                parsed = _try_extract_json(content) or _try_extract_json(r.text)
+                return {"success": True, "parsed": parsed, "raw": content, "diagnostics": diag}
+            except Exception:
+                return {"success": True, "parsed": None, "raw": r.text, "diagnostics": diag}
+        else:
+            return {"success": False, "parsed": None, "raw": r.text, "diagnostics": diag}
+    except Exception as e:
+        return {"success": False, "parsed": None, "raw": None, "diagnostics": {"exception": repr(e)}}
+
+# -------------------------
+# Prompts (strict JSON)
+# -------------------------
+JD_PROMPT = """You are a JSON extractor. Given the Job Description below, return ONLY a valid JSON object with keys:
 - title (string)
 - must_have (array of short canonical skill strings)
 - good_to_have (array of short canonical skill strings)
-- qualifications (array of strings: degrees/certifications)
-- experience (string, e.g., "1-3 years" or "")
+- qualifications (array of strings for degrees/certs)
+- experience (string)
 
-Keep skill names short (1-3 words), canonical (e.g., "Python", "PyTorch", "NLP"). Return only JSON, no commentary.
+Keep skill names short, canonical, and consistent. Return only JSON.
 
 Job Description:
 \"\"\"{jd}\"\"\"
 """
 
-EVAL_PROMPT = """You are a resume evaluator. Given a structured JD (JSON) and a resume text, return ONLY valid JSON with keys:
-- hard (number 0-100) : keyword/requirements coverage
-- soft (number 0-100) : semantic fit score
-- final (number 0-100) : final weighted score (final = hard_weight*hard + soft_weight*soft)
-- verdict (string): one of "High", "Medium", "Low"
-- missing (object): { "must": [...], "good": [...] } lists of missing items from JD
-- feedback (array of short actionable strings 3-6 items)
+EVAL_PROMPT = """You are an objective resume evaluator. Given a JD JSON and a resume excerpt, return only JSON with keys:
+- hard (0-100)
+- soft (0-100)
+- final (0-100)  # final = hard_weight*hard + soft_weight*soft
+- verdict (one of "High","Medium","Low")
+- missing: {{ "must": [...], "good": [...] }}
+- feedback: [short actionable strings]
 
-Inputs:
-JD_PARSED_JSON:
+JD_JSON:
 {jd_json}
 
 Resume (first 7000 chars):
 \"\"\"{resume_excerpt}\"\"\"
 
-Use weights:
 hard_weight: {hard_weight}
 soft_weight: {soft_weight}
-
-Return only JSON.
 """
 
 # -------------------------
-# Heuristic fallback parser + scorer (offline)
+# Heuristic fallback (offline)
 # -------------------------
 def heuristic_parse_jd(text: str) -> Dict[str, Any]:
-    res = {"title": "", "must_have": [], "good_to_have": [], "qualifications": [], "experience": ""}
+    out = {"title": "", "must_have": [], "good_to_have": [], "qualifications": [], "experience": ""}
     for line in text.splitlines():
         if line.strip():
-            res["title"] = line.strip()[:200]; break
+            out["title"] = line.strip()[:200]; break
     must = re.findall(r'(?:must[-\s]*have|required)[:\-\s]*([^\n;]+)', text, flags=re.I)
-    good = re.findall(r'(?:nice[-\s]*to[-\s]*have|good[-\s]*to[-\s]*have|preferred)[:\-\s]*([^\n;]+)', text, flags=re.I)
+    good = re.findall(r'(?:nice[-\s]*to[-\s]*have|preferred|good[-\s]*to[-\s]*have)[:\-\s]*([^\n;]+)', text, flags=re.I)
     quals = re.findall(r'(?:qualification|education|degree|certification)[:\-\s]*([^\n;]+)', text, flags=re.I)
     def split_and_clean(s): return [p.strip() for p in re.split(r'[,\;/\|]', s) if p.strip()]
-    for m in must: res["must_have"].extend(split_and_clean(m))
-    for g in good: res["good_to_have"].extend(split_and_clean(g))
-    for q in quals: res["qualifications"].extend(split_and_clean(q))
+    for m in must: out["must_have"].extend(split_and_clean(m))
+    for g in good: out["good_to_have"].extend(split_and_clean(g))
+    for q in quals: out["qualifications"].extend(split_and_clean(q))
     exp = re.search(r'(\d+\+?\s+years?|\d+-\d+\s+years)', text, flags=re.I)
-    if exp: res["experience"] = exp.group(0)
-    if not res["must_have"]:
+    if exp: out["experience"] = exp.group(0)
+    if not out["must_have"]:
         tokens = re.findall(r'\b[A-Za-z\+\#]{2,}(?:\s+[A-Za-z\+\#]{2,}){0,2}\b', text)
         noise = {"our","we","the","and","or","to","in","with","from","that","this","apply","role","job"}
-        out=[]; seen=set()
+        seen=set()
         for t in tokens:
             tl = t.lower()
             if tl in noise or len(t)<=2: continue
             if tl in seen: continue
-            seen.add(tl); out.append(t)
-            if len(out)>=12: break
-        res["must_have"].extend(out)
-    return res
+            seen.add(tl); out["must_have"].append(t)
+            if len(out["must_have"])>=12: break
+    return out
 
 def heuristic_score(resume_text: str, jd_parsed: Dict[str, Any], hard_weight=0.6, soft_weight=0.4) -> Dict[str, Any]:
     must = jd_parsed.get("must_have", [])
     good = jd_parsed.get("good_to_have", [])
-    found_must = []
-    found_good = []
+    found_must=[]; found_good=[]
     if _HAS_RAPIDFUZZ:
         for s in must:
-            if fuzz.partial_ratio(s.lower(), resume_text.lower()) >= 70:
-                found_must.append(s)
+            if fuzz.partial_ratio(s.lower(), resume_text.lower()) >= 70: found_must.append(s)
         for s in good:
-            if fuzz.partial_ratio(s.lower(), resume_text.lower()) >= 70:
-                found_good.append(s)
+            if fuzz.partial_ratio(s.lower(), resume_text.lower()) >= 70: found_good.append(s)
     else:
         for s in must:
             if s.lower() in resume_text.lower(): found_must.append(s)
@@ -275,7 +272,7 @@ def heuristic_score(resume_text: str, jd_parsed: Dict[str, Any], hard_weight=0.6
     hard = round((0.75*must_cov + 0.25*good_cov)*100,2)
     soft = round(hard * 0.92,2)
     final = round(hard_weight*hard + soft_weight*soft,2)
-    verdict = "High" if final >= 75 else "Medium" if final >=50 else "Low"
+    verdict = "High" if final >=75 else "Medium" if final >=50 else "Low"
     missing = {"must":[m for m in must if m not in found_must], "good":[g for g in good if g not in found_good]}
     feedback = [f"Add a short project/cert demonstrating: {m}" for m in missing["must"][:4]]
     return {"hard": hard, "soft": soft, "final": final, "verdict": verdict, "missing": missing, "feedback": feedback}
@@ -283,158 +280,158 @@ def heuristic_score(resume_text: str, jd_parsed: Dict[str, Any], hard_weight=0.6
 # -------------------------
 # Streamlit UI
 # -------------------------
-st.set_page_config(layout="wide", page_title="Groq Resume Relevance")
-st.title("Groq Resume Relevance — JD parsing & resume scoring")
+st.set_page_config(page_title="Resume Relevance (Auto Groq)", layout="wide")
+st.title("Resume Relevance — give a key, nothing else (auto-handled)")
 
-# Sidebar: Groq config
-st.sidebar.header("Groq API settings")
-groq_url = st.sidebar.text_input("Groq API URL (full endpoint)", value=os.getenv("GROQ_API_URL",""))
-groq_key = st.sidebar.text_input("Groq API Key", value=os.getenv("GROQ_API_KEY",""), type="password")
-st.sidebar.caption("If your Groq endpoint requires a different payload, the app tries common shapes (input, prompt, messages).")
-st.sidebar.markdown("---")
-st.sidebar.write("Cache is stored locally to avoid repeated LLM calls.")
+# Sidebar: only API key & provider preference
+st.sidebar.header("API Key (enter only key)")
+api_key_input = st.sidebar.text_input("API Key (Groq or OpenAI)", type="password")
+force_openai = st.sidebar.checkbox("Force OpenAI (skip Groq auto-tries)", value=False)
+use_auto_candidates = st.sidebar.checkbox("Auto-try Groq endpoints (recommended)", value=True)
+st.sidebar.markdown("You do NOT need to enter endpoints. App will auto-try known Groq endpoints. If all fails it will fall back to a local heuristic parser.")
 
-# JD upload or paste
-st.header("1) Job Description (JD)")
-col_left, col_right = st.columns([3,1])
-with col_left:
-    jd_file = st.file_uploader("Upload JD (PDF / DOCX / TXT) or paste text below", type=["pdf","docx","txt"])
-    jd_text_area = st.text_area("Paste JD text (overrides file preview)", height=260)
-with col_right:
-    if st.button("Clear cached JD"):
-        CACHE["jd"].clear(); save_cache(CACHE); st.success("Cached JD cleared.")
+# JD upload/paste
+st.header("1) Upload or paste Job Description (JD)")
+col1, col2 = st.columns([3,1])
+with col1:
+    jd_file = st.file_uploader("Upload JD (PDF / DOCX / TXT) or paste below", type=["pdf","docx","txt"])
+    jd_text_area = st.text_area("Paste JD text here (overrides file)", height=240)
+with col2:
+    if st.button("Clear parsed JD session"):
+        st.session_state.pop("parsed_jd", None)
+        st.success("Cleared parsed JD.")
 
 jd_text = ""
 if jd_file:
     try:
         jd_text = extract_text_from_bytes(jd_file.read(), jd_file.name)
     except Exception as e:
-        st.error("Failed to extract JD: " + str(e))
+        st.error(f"Failed to read JD file: {e}")
 if jd_text_area.strip():
     jd_text = jd_text_area
 
-if jd_text.strip():
-    st.subheader("JD preview (first 1200 chars)")
-    st.code(jd_text[:1200])
-    # parse actions
-    parse_col, heur_col = st.columns(2)
-    with parse_col:
-        if st.button("Parse JD (Groq)"):
-            # cache key - simple hash of content
-            cache_key = "jd_" + str(abs(hash(jd_text)) % (10**12))
-            if cache_key in CACHE["jd"]:
-                parsed = CACHE["jd"][cache_key]
-                st.success("Loaded parsed JD from cache.")
-                st.json(parsed)
-                st.session_state["parsed_jd"] = parsed
-            else:
-                if not groq_url or not groq_key:
-                    st.warning("Groq URL or API key not provided. Using local heuristic fallback.")
-                    parsed = heuristic_parse_jd(jd_text)
-                    st.json(parsed)
-                    st.session_state["parsed_jd"] = parsed
-                else:
-                    with st.spinner("Calling Groq for JD parsing..."):
-                        out = call_groq_endpoint(JD_PROMPT.format(jd=jd_text), groq_url, groq_key, max_tokens=800, temperature=0.0)
-                        if out["success"] and out["parsed_json"]:
-                            parsed = out["parsed_json"]
-                            # minimal normalization
-                            parsed = {
-                                "title": parsed.get("title", "") if isinstance(parsed.get("title",""), str) else "",
-                                "must_have": parsed.get("must_have",[]) if isinstance(parsed.get("must_have",[]), list) else [],
-                                "good_to_have": parsed.get("good_to_have",[]) if isinstance(parsed.get("good_to_have",[]), list) else [],
-                                "qualifications": parsed.get("qualifications",[]) if isinstance(parsed.get("qualifications",[]), list) else [],
-                                "experience": parsed.get("experience","") if isinstance(parsed.get("experience",""), str) else "",
-                                "raw_text": jd_text
-                            }
-                            CACHE["jd"][cache_key] = parsed; save_cache(CACHE)
-                            st.success("Parsed JD (Groq).")
-                            st.json(parsed)
-                            st.session_state["parsed_jd"] = parsed
-                        else:
-                            st.error("Groq parse failed — falling back to heuristic. See diagnostics.")
-                            st.json(out["diagnostics"])
-                            parsed = heuristic_parse_jd(jd_text)
-                            parsed["parse_fallback_reason"] = out["diagnostics"].get("last_error", "groq_failed")
-                            st.subheader("Heuristic JD parse (fallback)")
-                            st.json(parsed)
-                            st.session_state["parsed_jd"] = parsed
-    with heur_col:
-        if st.button("Parse JD (heuristic)"):
-            parsed = heuristic_parse_jd(jd_text)
-            st.success("Parsed JD using heuristic.")
-            st.json(parsed)
-            st.session_state["parsed_jd"] = parsed
-else:
+if not jd_text.strip():
     st.info("Upload or paste a Job Description to parse.")
 
-# Resumes upload & evaluate
-st.header("2) Upload resumes & evaluate against parsed JD")
+# Parse JD action
+if jd_text.strip():
+    st.subheader("JD preview")
+    st.code(jd_text[:1200])
+    if st.button("Parse JD (auto)"):
+        key = api_key_input.strip()
+        parsed = None
+        diagnostics = {}
+        # if user requested OpenAI only or key looks like OpenAI sk-, try OpenAI
+        try_openai_first = False
+        if force_openai or (key.startswith("sk-") and len(key) > 20):
+            try_openai_first = True
+
+        if try_openai_first and key:
+            st.info("Trying OpenAI (key looks like OpenAI or forced).")
+            o = try_openai_direct(key, JD_PROMPT.format(jd=jd_text))
+            diagnostics["openai"] = o["diagnostics"] if "diagnostics" in o else {}
+            if o["success"] and o.get("parsed"):
+                parsed = o["parsed"]
+        # If not parsed yet and auto candidates enabled, try Groq candidates
+        if parsed is None and key and use_auto_candidates and not try_openai_first:
+            st.info("Auto-trying Groq candidate endpoints (no endpoint input required).")
+            g = try_remote_with_key(key, JD_PROMPT.format(jd=jd_text), GROQ_CANDIDATES)
+            diagnostics["groq"] = g["diagnostics"]
+            if g["success"] and g.get("parsed"):
+                parsed = g["parsed"]
+        # If still none and key exists, try OpenAI fallback automatically
+        if parsed is None and key and not try_openai_first:
+            st.info("Groq attempts failed or returned non-JSON; trying OpenAI fallback.")
+            o = try_openai_direct(key, JD_PROMPT.format(jd=jd_text))
+            diagnostics["openai_fallback"] = o.get("diagnostics", {})
+            if o["success"] and o.get("parsed"):
+                parsed = o["parsed"]
+        # If parsed still None -> heuristic
+        if parsed is None:
+            st.warning("Remote parsing failed or returned no structured JSON; using local heuristic fallback.")
+            parsed = heuristic_parse_jd(jd_text)
+            parsed["_parse_mode"] = "heuristic_fallback"
+            parsed["_diagnostics"] = diagnostics
+            st.json(parsed)
+            st.session_state["parsed_jd"] = parsed
+        else:
+            # normalize and store
+            parsed_norm = {
+                "title": parsed.get("title","") if isinstance(parsed.get("title",""), str) else "",
+                "must_have": parsed.get("must_have",[]) if isinstance(parsed.get("must_have",[]), list) else [],
+                "good_to_have": parsed.get("good_to_have",[]) if isinstance(parsed.get("good_to_have",[]), list) else [],
+                "qualifications": parsed.get("qualifications",[]) if isinstance(parsed.get("qualifications",[]), list) else [],
+                "experience": parsed.get("experience","") if isinstance(parsed.get("experience",""), str) else ""
+            }
+            parsed_norm["_parse_mode"] = "remote"
+            parsed_norm["_diagnostics"] = diagnostics
+            st.success("Parsed JD (remote).")
+            st.json(parsed_norm)
+            st.session_state["parsed_jd"] = parsed_norm
+
+# Resumes upload & evaluation
+st.header("2) Upload resumes and evaluate")
 resume_files = st.file_uploader("Upload resumes (multiple) (PDF/DOCX/TXT)", accept_multiple_files=True, type=["pdf","docx","txt"])
 hard_weight = st.slider("Hard match weight", min_value=0.0, max_value=1.0, value=0.6, step=0.05)
 soft_weight = round(1.0 - hard_weight, 2)
-st.write("Soft weight:", soft_weight)
 
 if st.button("Evaluate resumes"):
     if "parsed_jd" not in st.session_state:
-        st.error("No parsed JD in session. Parse a JD first.")
+        st.error("Parse a JD first.")
     elif not resume_files:
-        st.error("Upload one or more resumes.")
+        st.error("Upload at least one resume file.")
     else:
         jd_parsed = st.session_state["parsed_jd"]
+        key = api_key_input.strip()
         results = []
         for f in resume_files:
             try:
-                content_bytes = f.read()
-                resume_text = extract_text_from_bytes(content_bytes, f.name)
-                # cache key derived from resume + jd
-                cache_key = "eval_" + str(abs(hash((resume_text[:4000], json.dumps(jd_parsed, sort_keys=True)))) % (10**12))
-                if cache_key in CACHE["resumes"]:
-                    res = CACHE["resumes"][cache_key]
-                    st.info(f"Loaded cached evaluation for {f.name}")
-                    results.append({"file": f.name, "result": res, "cached": True})
-                    continue
-
-                if not groq_url or not groq_key:
-                    # heuristic only
-                    res = heuristic_score(resume_text, jd_parsed, hard_weight, soft_weight)
-                    CACHE["resumes"][cache_key] = res; save_cache(CACHE)
-                    results.append({"file": f.name, "result": res, "cached": False})
-                else:
-                    # call groq for evaluation
-                    with st.spinner(f"Evaluating {f.name} with Groq..."):
-                        prompt = EVAL_PROMPT.format(jd_json=json.dumps(jd_parsed, ensure_ascii=False), resume_excerpt=resume_text[:7000], hard_weight=hard_weight, soft_weight=soft_weight)
-                        out = call_groq_endpoint(prompt, groq_url, groq_key, max_tokens=1000, temperature=0.0)
-                        if out["success"] and out["parsed_json"]:
-                            parsed_eval = out["parsed_json"]
-                            # normalize numeric fields
-                            try:
-                                parsed_eval["hard"] = float(parsed_eval.get("hard", 0.0))
-                                parsed_eval["soft"] = float(parsed_eval.get("soft", 0.0))
-                                parsed_eval["final"] = float(parsed_eval.get("final", round(parsed_eval["hard"]*hard_weight + parsed_eval["soft"]*soft_weight,2)))
-                            except Exception:
-                                parsed_eval = heuristic_score(resume_text, jd_parsed, hard_weight, soft_weight)
-                                parsed_eval["eval_fallback_reason"] = "groq_output_shape"
-                            CACHE["resumes"][cache_key] = parsed_eval; save_cache(CACHE)
-                            results.append({"file": f.name, "result": parsed_eval, "diagnostics": out["diagnostics"], "cached": False})
+                txt = extract_text_from_bytes(f.read(), f.name)
+                parsed_eval = None
+                diag = {}
+                # If key provided, try remote evaluation
+                if key:
+                    # prefer Groq auto unless forced OpenAI or key indicates OpenAI
+                    tried_openai = False
+                    if force_openai or (key.startswith("sk-") and len(key)>20):
+                        tried_openai = True
+                        o = try_openai_direct(key, EVAL_PROMPT.format(jd_json=json.dumps(jd_parsed, ensure_ascii=False), resume_excerpt=txt[:7000], hard_weight=hard_weight, soft_weight=soft_weight))
+                        diag["openai"] = o.get("diagnostics", {})
+                        if o["success"] and o.get("parsed"):
+                            parsed_eval = o["parsed"]
+                    if parsed_eval is None and not tried_openai:
+                        g = try_remote_with_key(key, EVAL_PROMPT.format(jd_json=json.dumps(jd_parsed, ensure_ascii=False), resume_excerpt=txt[:7000], hard_weight=hard_weight, soft_weight=soft_weight), GROQ_CANDIDATES)
+                        diag["groq"] = g.get("diagnostics", {})
+                        if g["success"] and g.get("parsed"):
+                            parsed_eval = g["parsed"]
                         else:
-                            # fallback
-                            st.warning(f"Groq eval failed for {f.name} — using heuristic fallback. See diagnostics.")
-                            st.json(out["diagnostics"])
-                            parsed_eval = heuristic_score(resume_text, jd_parsed, hard_weight, soft_weight)
-                            parsed_eval["eval_fallback_reason"] = out["diagnostics"].get("last_error", "groq_failed")
-                            CACHE["resumes"][cache_key] = parsed_eval; save_cache(CACHE)
-                            results.append({"file": f.name, "result": parsed_eval, "diagnostics": out["diagnostics"], "cached": False})
+                            # try openai fallback
+                            o = try_openai_direct(key, EVAL_PROMPT.format(jd_json=json.dumps(jd_parsed, ensure_ascii=False), resume_excerpt=txt[:7000], hard_weight=hard_weight, soft_weight=soft_weight))
+                            diag["openai_fallback"] = o.get("diagnostics", {})
+                            if o["success"] and o.get("parsed"):
+                                parsed_eval = o["parsed"]
+                # If remote didn't produce parsed result -> heuristic score
+                if parsed_eval is None:
+                    parsed_eval = heuristic_score(txt, jd_parsed, hard_weight, soft_weight)
+                    parsed_eval["_eval_mode"] = "heuristic"
+                else:
+                    # normalize numbers if present
+                    try:
+                        parsed_eval["hard"] = float(parsed_eval.get("hard", 0.0))
+                        parsed_eval["soft"] = float(parsed_eval.get("soft", 0.0))
+                        parsed_eval["final"] = float(parsed_eval.get("final", round(parsed_eval["hard"]*hard_weight + parsed_eval["soft"]*soft_weight,2)))
+                    except Exception:
+                        parsed_eval = heuristic_score(txt, jd_parsed, hard_weight, soft_weight)
+                        parsed_eval["_eval_mode"] = "heuristic_after_parse_error"
+                results.append({"file": f.name, "result": parsed_eval, "diagnostics": diag})
             except Exception as e:
-                st.error(f"Failed processing {f.name}: {e}")
+                st.error(f"Failed to process {f.name}: {e}")
                 st.text(traceback.format_exc())
-
-        # show sorted results
-        results = sorted(results, key=lambda x: x["result"].get("final", 0), reverse=True)
-        st.header("Evaluation results")
+        # display results sorted
+        results = sorted(results, key=lambda r: r["result"].get("final",0), reverse=True)
         for r in results:
             res = r["result"]
-            st.subheader(f"{r['file']} — Final: {res.get('final','N/A')}  Verdict: {res.get('verdict','N/A')}{' (cached)' if r.get('cached') else ''}")
+            st.subheader(f"{r['file']}  — Final: {res.get('final','N/A')}  Verdict: {res.get('verdict','N/A')}")
             st.write("Hard:", res.get("hard"), "Soft:", res.get("soft"))
             missing = res.get("missing", {})
             st.write("Missing (must):", missing.get("must", []))
@@ -445,9 +442,8 @@ if st.button("Evaluate resumes"):
                 for item in fb[:6]:
                     st.markdown(f"- {item}")
             if r.get("diagnostics"):
-                with st.expander("Groq diagnostics (for this file)"):
+                with st.expander("Diagnostics"):
                     st.json(r["diagnostics"])
 
 st.markdown("---")
-st.caption("Tips: Use real Groq API URL & API key in the sidebar. If Groq fails or you lack a key, the app falls back to a local heuristic.")
-
+st.caption("You only need to supply an API key. App auto-tries Groq endpoints and OpenAI as fallback. If remote fails, it uses a local heuristic so the app always works.")
