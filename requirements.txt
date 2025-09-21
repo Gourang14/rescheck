@@ -1,4 +1,3 @@
-# Core
 streamlit>=1.36.0
 pandas>=2.0.0
 numpy>=1.24.0
@@ -23,7 +22,4 @@ groq>=0.4.2
 # Testing
 pytest>=7.4.0
 rapidfuzz>=3.0.0
-google-genai
-PyPDF2
-docx
-exceptions
+sqlalchemy
