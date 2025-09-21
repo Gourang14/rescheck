@@ -1,4 +1,4 @@
-# Resume Relevance Check — MVP
+# Automated Resume Relevance Check System
 
 An **AI-powered system** that evaluates resumes against job descriptions (JDs).  
 It produces a **Relevance Score (0–100)**, highlights missing skills, and generates actionable feedback — helping recruiters quickly shortlist candidates.
@@ -47,3 +47,9 @@ cd rescheck
 python -m venv venv
 source venv/bin/activate   # on Windows: venv\Scripts\activate
 pip install -r requirements.txt
+
+
+[![Python](https://img.shields.io/badge/Python-3.11-blue.svg)](https://www.python.org/)  
+[![FastAPI](https://img.shields.io/badge/FastAPI-Backend-brightgreen.svg)](https://fastapi.tiangolo.com/)  
+[![Streamlit](https://img.shields.io/badge/Streamlit-Frontend-ff4b4b.svg)](https://streamlit.io/)  
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
