@@ -243,44 +243,81 @@
 
 
 # backend/services/jd_parser.py
-import os
-from typing import Dict
-from . import jd_heuristic  # your existing heuristic parser module (rename to match your repo)
+import os, json, traceback
+from typing import Dict, Optional
 from backend.services import groq_client
 
-# Strict JSON extraction prompt template
+# simple heuristic fallback (keeps existing logic minimal)
+def heuristic_parse_jd(raw_text: str) -> Dict:
+    text = raw_text or ""
+    res = {"title": "", "must_have": [], "good_to_have": [], "qualifications": [], "experience": "", "raw_text": text}
+    for line in text.splitlines():
+        if line.strip():
+            res["title"] = line.strip()[:200]
+            break
+    import re
+    def find(p): 
+        m = re.findall(p, text, flags=re.I)
+        return " ; ".join(m) if m else ""
+    must = find(r'(?:must[-\s]*have|required|requirements?)\s*[:\-–]\s*([^\n]+)')
+    good = find(r'(?:nice[-\s]*to[-\s]*have|good[-\s]*to[-\s]*have|preferred)\s*[:\-–]\s*([^\n]+)')
+    quals = find(r'(?:qualification|qualifications|education)\s*[:\-–]\s*([^\n]+)')
+    def split_list(s): return [t.strip() for t in re.split(r'[,\n;/\|]', s) if t.strip()]
+    if must: res["must_have"].extend(split_list(must))
+    if good: res["good_to_have"].extend(split_list(good))
+    if quals: res["qualifications"].extend(split_list(quals))
+    m = re.search(r'(\d+\+?\s+years?|\d+-\d+\s+years|\d+\s+years? of experience)', text, flags=re.I)
+    if m: res["experience"] = m.group(0)
+    return res
+
+# LLM prompt should output strict JSON
 JD_PROMPT = """
-You are an automated parser. Given the job description text below, extract a JSON object with exactly these keys:
+You are an assistant that MUST return only valid JSON and nothing else.
+Given the following job description, extract and return JSON with keys:
 - title (string)
-- must_have (array of short strings)  -- skills or technologies explicitly required
-- good_to_have (array of short strings) -- optional skills
-- qualifications (array of short strings)
-- experience (string) e.g. "1-3 years" or empty string if not present
+- must_have (array of short strings)
+- good_to_have (array of short strings)
+- qualifications (array of strings)
+- experience (string)
 
 Job description:
 \"\"\"{jd}\"\"\"
 
-Return only valid JSON (no explanation). Keep skill names short (1-4 words), prefer canonical forms (e.g., "Python", "NLP", "PyTorch", "TensorFlow", "Spark").
+Return only JSON.
 """
 
-def parse_jd_with_groq(jd_text: str, model_url: str = None) -> Dict:
-    # try LLM-based extraction if key/url provided
+def parse_jd_with_groq(jd_text: str, model_url: Optional[str] = None, api_key: Optional[str] = None) -> Dict:
     try:
-        parsed = groq_client.groq_generate_json(JD_PROMPT.format(jd=jd_text), max_tokens=800, temperature=0.0, model_url=model_url)
-        # ensure keys exist and are lists/strings
-        r = {
-            "title": parsed.get("title","") if isinstance(parsed.get("title",""), str) else "",
-            "must_have": parsed.get("must_have", []) if isinstance(parsed.get("must_have", []), list) else [],
-            "good_to_have": parsed.get("good_to_have", []) if isinstance(parsed.get("good_to_have", []), list) else [],
-            "qualifications": parsed.get("qualifications", []) if isinstance(parsed.get("qualifications", []), list) else [],
-            "experience": parsed.get("experience","") if isinstance(parsed.get("experience",""), str) else "",
-            "raw_text": jd_text
-        }
-        return r
+        prompt = JD_PROMPT.format(jd=jd_text)
+        parsed = groq_client.groq_generate_json(prompt, model_url=model_url, api_key=api_key, max_output_tokens=800, temperature=0.0)
+        # If provider returned raw_response wrapper, throw to fallback so user sees fallback result + groq output
+        if isinstance(parsed, dict) and "raw_response" in parsed:
+            return {"parse_error": "groq_raw", "groq_raw": parsed["raw_response"], **heuristic_parse_jd(jd_text)}
+        # If parsed is a dict with keys, normalize
+        if isinstance(parsed, dict):
+            # ensure types
+            return {
+                "title": parsed.get("title","") if isinstance(parsed.get("title",""), str) else "",
+                "must_have": parsed.get("must_have",[]) if isinstance(parsed.get("must_have",[]), list) else [],
+                "good_to_have": parsed.get("good_to_have",[]) if isinstance(parsed.get("good_to_have",[]), list) else [],
+                "qualifications": parsed.get("qualifications",[]) if isinstance(parsed.get("qualifications",[]), list) else [],
+                "experience": parsed.get("experience","") if isinstance(parsed.get("experience",""), str) else "",
+                "raw_text": jd_text
+            }
+        # else fallback
+        return heuristic_parse_jd(jd_text)
     except Exception as e:
-        # fallback to heuristic parser you already have
-        try:
-            return jd_heuristic.extract_skills_from_jd_improved(jd_text)
-        except Exception:
-            # last-resort simple structure
-            return {"title": jd_text.splitlines()[0] if jd_text else "", "must_have": [], "good_to_have": [], "qualifications": [], "experience": "", "raw_text": jd_text}
+        # include error for visibility
+        return {"parse_error": "groq_exception", "groq_exception": repr(e), "traceback": traceback.format_exc(), **heuristic_parse_jd(jd_text)}
+
+def parse_jd(jd_text: str, use_groq: bool = True, model_url: Optional[str] = None, api_key: Optional[str] = None) -> Dict:
+    """
+    Public: try Groq if use_groq True or credentials present; otherwise heuristic parse.
+    """
+    # prefer explicit pass; otherwise use env vars if present
+    model_url = model_url or os.getenv("GROQ_API_URL", None)
+    api_key = api_key or os.getenv("GROQ_API_KEY", None)
+    if use_groq and (model_url or api_key or (os.getenv("GROQ_API_URL") and os.getenv("GROQ_API_KEY"))):
+        return parse_jd_with_groq(jd_text, model_url=model_url, api_key=api_key)
+    return heuristic_parse_jd(jd_text)
+
