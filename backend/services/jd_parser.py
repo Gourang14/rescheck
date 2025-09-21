@@ -1,191 +1,171 @@
 # backend/services/jd_parser.py
 import re
-from typing import List, Dict
+from typing import List, Dict, Set
 
-# noise tokens to filter out obvious junk words/phrases
-NOISE_TOKENS = set([
-    "job","role","description","overview","apply","apply now","detailed","duration",
-    "internship","interns","walk","bond","work","attendance","students","position","the","and","or",
-    "responsibilities","responsibility","responsible","will","years","experience","apply","send","resume"
+# connectors and company noise to trim or remove
+CONNECTORS = [' from ', ' including ', ' that ', ' which ', ' and ', ' & ', ' , ', ';', ':', ' - ', ' – ', ' — ', ' to ', ' by ']
+COMPANIES = ['palantir', 'mckinsey', 'quantumblack', 'axion', 'ray']  # lowercase
+NOISE_WORDS = set([
+    "apply","send","resume","our","we","team","since","largest","founding","deployed","onset",
+    "job","role","description","overview","detailed","duration","internship","interns","work"
 ])
+VERB_WORDS = set(["work","develop","design","build","use","deploy","create","partner","solve","revolutionize","accelerate"])
 
-# common alias mappings – extend this to canonicalize common names
-ALIASES = {
-    "tensorflow": ["tensor flow","tf"],
-    "pytorch": ["py torch","torch"],
-    "c++": ["cpp"],
-    "c#": ["csharp"],
-    "machine learning": ["ml"],
-    "deep learning": ["dl"],
-    "natural language processing": ["nlp"],
-    "computer vision": ["cv"],
-    "spark": ["apache spark"],
-    "tableau": ["tableau desktop"],
-    "sql": ["structured query language"]
-}
+def normalize_token(tok: str) -> str:
+    t = tok.strip()
+    t = re.sub(r'^[\W_]+|[\W_]+$', '', t)  # trim punctuation edges
+    t = re.sub(r'\s+', ' ', t).strip()
+    return t
 
-# filter words that indicate a phrase is actually a verb/clause rather than a skill
-VERB_FILTER = set(["work","works","will","develop","developing","design","building","build","using","use","experience","lead","leads"])
+def split_multi(s: str) -> List[str]:
+    # split combined items like "NLP/LLMs" or "AI and NLP"
+    parts = re.split(r'[\/\|,&]| and | & ', s, flags=re.I)
+    return [p.strip() for p in parts if p.strip()]
 
-def normalize_skill(tok: str) -> str:
-    s = tok.strip()
-    s = re.sub(r'[\s\-/]+', ' ', s)                 # unify separators to spaces
-    s = re.sub(r'[^\w\+\#\. ]', '', s)             # remove unwanted punctuation (keep +,#,.)
-    s = s.strip()
+def trim_after_connectors(s: str) -> str:
+    s_low = s.lower()
+    for c in CONNECTORS:
+        if c.strip() and c in s_low:
+            pos = s_low.find(c)
+            s = s[:pos].strip()
+            s_low = s.lower()
+    # final punctuation trim
+    return re.sub(r'^[\W_]+|[\W_]+$', '', s).strip()
+
+def clean_candidate(s: str) -> str:
+    s = s.replace("’", "'").replace("“","\"").replace("”","\"")
+    s = re.sub(r'[\(\)\[\]]', '', s)
+    s = normalize_token(s)
+    s = trim_after_connectors(s)
     if not s:
         return ""
-    s_low = s.lower()
-    # canonicalize common aliases
-    for canon, aliases in ALIASES.items():
-        if s_low == canon: return canon
-        for a in aliases:
-            if s_low == a: return canon
+    low = s.lower()
+    # remove company mentions
+    for comp in COMPANIES:
+        if comp in low:
+            s = re.sub(re.escape(comp), '', s, flags=re.I).strip()
+            low = s.lower()
+    # drop noisy/verb-containing tokens
+    if any(w in low for w in NOISE_WORDS):
+        return ""
+    if any(v in low for v in VERB_WORDS):
+        return ""
+    if len(s.split()) > 6:
+        return ""
+    # drop very short tokens
+    if len(re.sub(r'[^A-Za-z0-9]', '', s)) <= 1:
+        return ""
     return s
 
-def filter_noise(skills: List[str]) -> List[str]:
-    out = []
-    seen = set()
-    for s in skills:
-        if not s: continue
-        s_norm = normalize_skill(s)
-        if not s_norm: continue
-        # basic filters
-        if len(s_norm) <= 1: continue
-        if any(tok in s_norm.lower() for tok in NOISE_TOKENS): continue
-        if len(s_norm.split()) > 5: continue                 # drop very long phrases
-        if any(v in s_norm.lower().split() for v in VERB_FILTER): continue
-        if re.fullmatch(r'\d+(\.\d+)?', s_norm): continue
-        if s_norm.lower() in seen: continue
-        seen.add(s_norm.lower())
-        out.append(s_norm)
-    return out
+def initial_candidates(text: str) -> List[str]:
+    cand = []
+    # titlecase chunks (up to 4 words)
+    cand += re.findall(r'\b(?:[A-Z][a-z0-9\+\#]{1,})(?:\s+[A-Z][a-z0-9\+\#]{1,}){0,3}\b', text)
+    # acronyms like NLP, LLMs, AI
+    cand += re.findall(r'\b[A-Z]{2,6}s?\b', text)
+    # content inside parentheses
+    for p in re.findall(r'\(([^)]+)\)', text):
+        for part in re.split(r'[,\;/\|]', p):
+            cand.append(part)
+    # inline lists: "Must have: ..." etc.
+    for m in re.findall(r'(?im)(?:must[-\s]*have|required)[:\-]\s*([^\n]*)', text):
+        for part in re.split(r'[,\;/\|]', m):
+            cand.append(part)
+    for m in re.findall(r'(?im)(?:nice[-\s]*to[-\s]*have|good[-\s]*to[-\s]*have|preferred)[:\-]\s*([^\n]*)', text):
+        for part in re.split(r'[,\;/\|]', m):
+            cand.append(part)
+    # also split long dash segments (short pieces may be tech)
+    for part in re.split(r'[-–—]', text):
+        if len(part.split()) <= 6:
+            cand.append(part)
+    return cand
 
-def split_candidates(text: str) -> List[str]:
-    # split on commas, bullets, semicolons, 'and', '/', pipes etc.
-    parts = re.split(r'[,\n;\u2022•\t]| and |/|\|', text)
-    tokens = [p.strip() for p in parts if p and p.strip()]
-    return tokens
-
-def extract_section_lists_block(raw: str, headings: List[str]) -> Dict[str,str]:
-    """
-    Find heading lines (e.g. "Skills:", "Must have:" or standalone headings)
-    and collect the content following that heading until next heading/blank.
-    """
-    text = raw.replace('\r','\n')
-    out = {}
-    lines = text.splitlines()
-    lower_headings = [h.lower() for h in headings]
-    for i, line in enumerate(lines):
-        low = line.strip().lower()
-        for h in lower_headings:
-            if low == h or low.startswith(h + ":") or low.startswith(h + " -") or low.startswith(h + " —"):
-                content = ""
-                # inline after colon on same line?
-                if ":" in line:
-                    content = line.split(":",1)[1].strip()
-                j = i+1
-                while j < len(lines) and lines[j].strip() and not any(lines[j].strip().lower().startswith(x) for x in lower_headings):
-                    content += ("\n" + lines[j]).strip()
-                    j += 1
-                out[h] = content.strip()
-    return out
-
-def extract_inline_sections(raw: str) -> Dict[str,str]:
-    """
-    Capture inline patterns like 'Must have: Python, SQL' that appear in the middle of a paragraph/line.
-    Returns dict keys 'must_have', 'good_to_have', 'qualifications' if matched.
-    """
-    out = {}
-    patterns = {
-        "must_have": r'(?im)\b(?:must[-\s]*have|required|requirements?)\s*[:\-–]\s*(.+)',
-        "good_to_have": r'(?im)\b(?:good[-\s]*to[-\s]*have|nice[-\s]*to[-\s]*have|preferred)\s*[:\-–]\s*(.+)',
-        "qualifications": r'(?im)\b(?:qualification|qualifications|education)\s*[:\-–]\s*(.+)',
-    }
-    for k,p in patterns.items():
-        matches = re.findall(p, raw)
-        if matches:
-            out[k] = " \n ".join(matches)
-    return out
-
-def parse_jd(raw_text: str) -> Dict:
-    """
-    Main improved parser. Returns:
-      { title, must_have, good_to_have, qualifications, experience }
-    - Works with inline "Must have: ..." and block-style headings.
-    - Filters noise tokens and deduplicates.
-    """
+def extract_skills_from_jd(raw_text: str) -> Dict:
     jd = raw_text or ""
-    res = {"title": "", "must_have": [], "good_to_have": [], "qualifications": [], "experience": ""}
+    result = {"title": "", "must_have": [], "good_to_have": [], "qualifications": [], "experience": ""}
 
     # title: first non-empty line
     for line in jd.splitlines():
         if line.strip():
-            res["title"] = line.strip()[:200]
+            result["title"] = line.strip()[:200]
             break
 
-    # experience detection (e.g. "1-3 years", "3+ years of experience")
+    # detect experience pattern if present
     m = re.search(r'(\d+\+?\s+years?|\d+-\d+\s+years|\d+\s+years? of experience)', jd, flags=re.I)
     if m:
-        res["experience"] = m.group(0).strip()
+        result["experience"] = m.group(0).strip()
 
-    # 1) inline patterns ("Must have: ...")
-    inline = extract_inline_sections(jd)
-    if "must_have" in inline:
-        res["must_have"].extend(split_candidates(inline["must_have"]))
-    if "good_to_have" in inline:
-        res["good_to_have"].extend(split_candidates(inline["good_to_have"]))
-    if "qualifications" in inline:
-        res["qualifications"].extend(split_candidates(inline["qualifications"]))
+    # build candidate pool
+    raw = initial_candidates(jd)
+    processed = []
+    seen = set()
+    for r in raw:
+        for part in split_multi(r):
+            cleaned = clean_candidate(part)
+            if not cleaned:
+                continue
+            key = cleaned.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            processed.append(cleaned)
 
-    # 2) block headings (lines that are headings)
-    headings = ["must have","must-have","required","requirements","skills","skillset","good to have","nice to have","preferred","qualification","qualifications","education","experience"]
-    block = extract_section_lists_block(jd, headings)
-    for h,content in block.items():
-        key = None
-        if h in ("must have","must-have","required","requirements","skills","skillset"):
-            key = "must_have"
-        elif h in ("good to have","nice to have","preferred"):
-            key = "good_to_have"
-        elif h in ("qualification","qualifications","education"):
-            key = "qualifications"
-        if key:
-            tokens = split_candidates(content)
-            res[key].extend(tokens)
+    # find signal ngrams for likely tech phrases (robust catch of lower-case phrases)
+    tokens = re.findall(r"[A-Za-z\+\#]{2,}", jd.lower())
+    signal_phrases = set()
+    signal_keywords = [
+        "generative ai","generative","nlp","llm","llms","enterprise ai","computer vision",
+        "electric vehicle","electric vehicles","medical device","medical devices","ai models","ai",
+        "automotive","aerospace","supersonic","machine learning","deep learning"
+    ]
+    for n in range(1,4):
+        for i in range(len(tokens)-n+1):
+            seq = " ".join(tokens[i:i+n])
+            for sig in signal_keywords:
+                if sig in seq:
+                    signal_phrases.add(sig)
 
-    # 3) fallback: if no must_have found, look for likely list lines
-    if not res["must_have"]:
-        candidate_tokens = []
-        for line in jd.splitlines():
-            line = line.strip()
-            if not line: continue
-            # skip very long descriptive lines (likely responsibilities)
-            if len(line.split()) > 20: continue
-            if ',' in line or ';' in line or '/' in line or ' and ' in line:
-                candidate_tokens.extend(split_candidates(line))
+    # canonicalize and format signal phrases
+    final = []
+    for s in sorted(signal_phrases, key=lambda x:(-len(x.split()), x)):
+        if s.lower() in ["nlp","llm","llms","ai"]:
+            final.append(s.upper())
+        else:
+            final.append(s.title())
+
+    # merge processed items (titlecase / acronym results), with further cleaning
+    for s in processed:
+        s2 = trim_after_connectors(s)
+        s2 = clean_candidate(s2)
+        if not s2: continue
+        # split "AI and NLP" -> ["AI","NLP"]
+        for p in split_multi(s2):
+            p_clean = clean_candidate(p)
+            if not p_clean: continue
+            # format acronyms nicely
+            if p_clean.lower() in ["nlp","llm","llms","ai"]:
+                p_clean = p_clean.upper()
             else:
-                caps = re.findall(r'\b[A-Z][A-Za-z0-9\+\#\.]{1,}\b', line)
-                if len(caps) >= 2:
-                    candidate_tokens.extend(split_candidates(line))
-        res["must_have"].extend(candidate_tokens[:60])
+                p_clean = p_clean.title() if len(p_clean.split())>1 else (p_clean.upper() if p_clean.isalpha() and len(p_clean)<=3 else p_clean.capitalize())
+            if p_clean.lower() not in [f.lower() for f in final]:
+                final.append(p_clean)
 
-    # Filter & dedupe
-    res["must_have"] = filter_noise(res["must_have"])
-    res["good_to_have"] = filter_noise(res["good_to_have"])
-    res["qualifications"] = filter_noise(res["qualifications"])
+    # final dedupe preserving order
+    seen2 = set(); final_clean = []
+    for f in final:
+        if f.lower() in seen2: continue
+        seen2.add(f.lower()); final_clean.append(f)
 
-    # remove duplicates between must and good
-    must_set = set(m.lower() for m in res["must_have"])
-    res["good_to_have"] = [g for g in res["good_to_have"] if g.lower() not in must_set]
+    # heuristics: bucket must-have vs good-to-have by presence of core keywords
+    must_keys = ["ai","generative","nlp","llm","machine learning","computer vision","electric","vehicle","medical","enterprise","models"]
+    must = []; good = []
+    for f in final_clean:
+        low = f.lower()
+        if any(k in low for k in must_keys):
+            must.append(f)
+        else:
+            good.append(f)
 
-    # final fallback: frequency-based pick if must still empty
-    if not res["must_have"]:
-        tokens = re.findall(r'\b[A-Za-z\+\#\.]{2,}\b', jd)
-        freq = {}
-        for t in tokens:
-            tl = t.lower()
-            if tl in NOISE_TOKENS: continue
-            freq[tl] = freq.get(tl,0) + 1
-        sorted_tokens = [t for t,_ in sorted(freq.items(), key=lambda x: x[1], reverse=True)]
-        res["must_have"].extend(filter_noise(sorted_tokens[:20]))
-
-    return res
+    result["must_have"] = must[:15]
+    result["good_to_have"] = good[:15]
+    return result
