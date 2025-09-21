@@ -1,288 +1,267 @@
-# streamlit_app.py
-import sys, os, re, tempfile
-import streamlit as st
-import pandas as pd
-from typing import List
-
-# Calculate the absolute path to the project root ("rescheck")
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-
-# backend services
-from backend.services.parser import extract_resume_text, extract_text_from_pdf, extract_text_from_docx
-from backend.services.nlp_utils import section_split, extract_skills
-from backend.services.embeddings_manager import SBERTEmbeddingsProvider, OpenAIEmbeddingsProvider
-from backend.services.scoring import Scorer
-from backend.services.feedback import generate_feedback
-from backend.services.vectorstore_wrapper import VectorStoreWrapper
-
-# --- Page / theme setup ---
-st.set_page_config(page_title="Resume Relevance", layout="wide", initial_sidebar_state="expanded")
-
-CSS = """
-<style>
-    .stApp, .main {
-        background-color: #0b0b0d;
-        color: #e6e6e6;
-    }
-    .stButton>button { background-color: #111; color: #fff; border-radius:8px; }
-    .title { font-family: 'Helvetica', sans-serif; color:#FFD700; font-weight:700; font-size:28px; }
-    .card { background: linear-gradient(90deg, rgba(0,0,0,0.85), rgba(20,20,20,0.85)); border-radius:12px; padding:12px; margin-bottom:12px; box-shadow: 0 2px 6px rgba(0,0,0,0.5); }
-    .chip { padding:6px 10px; border-radius:999px; color:#fff; font-weight:700; display:inline-block; }
-    .chip-high { background: linear-gradient(90deg,#00b894,#00cec9); }
-    .chip-medium { background: linear-gradient(90deg,#ffeaa7,#fab1a0); color:#1b1b1b; }
-    .chip-low { background: linear-gradient(90deg,#ff7675,#d63031); }
-    .tag { display:inline-block; padding:4px 8px; border-radius:6px; background:#111; margin:2px; color:#fff; border:1px solid #222;}
-</style>
+# dashboard/streamlit_app.py
 """
-st.markdown(CSS, unsafe_allow_html=True)
+Streamlit app that:
+ - Uploads a Job Description (PDF/DOCX/TXT)
+ - Forces parsing via Groq LLM by sending model_url + api_key to backend /jd/upload
+ - Uploads resumes, then calls backend /evaluate (and passes groq creds so evaluator uses Groq)
+ - Shows parsed JD JSON, evaluation results, missing skills, feedback, and raw groq output on failure
 
-st.markdown("<div class='title'>🦇 Resume Relevance Checker — Batman Theme</div>", unsafe_allow_html=True)
-st.caption("Upload a Job Description and candidate resumes. The system returns a relevance score, missing skills, LLM feedback, and downloadable results.")
+Notes:
+ - Make sure your backend (FastAPI app) is running and its /jd/upload and /evaluate endpoints accept
+   model_url and api_key form fields (this app assumes that).
+ - Use Streamlit sidebar to enter Groq URL and API key (temporary for testing).
+"""
 
-# --- Sidebar: Settings & API Key ---
-with st.sidebar:
-    st.header("Settings & API Key")
-    if "api_key" not in st.session_state:
-        st.session_state["api_key"] = ""
-    api_key = st.text_input("API key (session only)", type="password", value=st.session_state["api_key"], key="api_key_input")
-    use_groq = st.checkbox("Enable Groq LLM for feedback (requires key)", value=True)
+import os
+import tempfile
+import json
+import requests
+import traceback
+import streamlit as st
+
+st.set_page_config(page_title="Resume Relevance — Groq JD parsing", layout="wide")
+st.title("Resume Relevance — Groq JD parsing (Llama-38B)")
+
+# -------------------------
+# Configurable endpoints
+# -------------------------
+DEFAULT_BACKEND = os.getenv("API_BASE", "http://localhost:8000")
+API_BASE = st.sidebar.text_input("Backend API base URL", value=DEFAULT_BACKEND)
+st.sidebar.markdown("**Groq (LLM) settings** — for parsing & evaluation")
+
+groq_url = st.sidebar.text_input("Groq API URL (full endpoint)", value=os.getenv("GROQ_API_URL", ""))
+groq_key = st.sidebar.text_input("Groq API Key", value=os.getenv("GROQ_API_KEY", ""), type="password")
+use_groq_checkbox = st.sidebar.checkbox("Use Groq for JD parsing & evaluation (send creds to backend)", value=True)
+
+st.sidebar.markdown("---")
+st.sidebar.write("Tips:")
+st.sidebar.write("- If Groq returns non-JSON, the backend will fallback to heuristic and return `parse_error` with raw response.")
+st.sidebar.write("- For production, set env vars in server instead of sending keys from UI.")
+
+# -------------------------
+# Helpers
+# -------------------------
+def show_exception(e):
+    st.error("Error: " + str(e))
+    st.text(traceback.format_exc())
+
+def preview_text_from_bytes(b: bytes, fname: str) -> str:
+    """
+    Try to provide a text preview from uploaded bytes.
+    For PDFs this will just show a byte-decoded preview (best-effort).
+    The authoritative extract should happen on backend using PyMuPDF/pdfplumber/docx2txt.
+    """
+    try:
+        return b.decode("utf-8", errors="ignore")[:4000]
+    except Exception:
+        return f"<binary content: {fname} — preview not available>"
+
+def upload_jd_to_backend(file_bytes: bytes, filename: str, title: str = "", use_groq: bool = True, model_url: str = None, api_key: str = None, backend_url: str = API_BASE):
+    """
+    Upload JD file to backend /jd/upload. This passes use_groq + model_url + api_key form fields.
+    Returns JSON response or raises.
+    """
+    files = {"file": (filename, file_bytes)}
+    data = {"use_groq": str(bool(use_groq)).lower()}
+    if title:
+        data["title"] = title
+    if model_url:
+        data["model_url"] = model_url
     if api_key:
-        st.session_state["api_key"] = api_key
+        data["api_key"] = api_key
+    resp = requests.post(f"{backend_url.rstrip('/')}/jd/upload", files=files, data=data, timeout=120)
+    resp.raise_for_status()
+    return resp.json()
 
-    st.markdown("---")
-    st.subheader("Embedding / Vector settings")
-    store_kind = st.selectbox("Vector store (for later)", ["none", "chroma", "faiss", "pinecone"])
-    embedding_choice = st.selectbox("Embeddings", ["sbert", "openai"])
-    st.markdown("---")
-    st.subheader("Scoring weights")
-    hard_weight = st.slider("Hard-match weight", min_value=0.0, max_value=1.0, value=0.6, step=0.05)
-    soft_weight = round(1.0 - hard_weight, 2)
-    st.markdown(f"**Soft-match weight:** {soft_weight}")
-    st.markdown("---")
-    if st.button("Clear session state"):
-        for k in list(st.session_state.keys()):
-            st.session_state.pop(k, None)
-        st.experimental_rerun()
+def upload_resume_to_backend(file_bytes: bytes, filename: str, backend_url: str = API_BASE):
+    files = {"file": (filename, file_bytes)}
+    resp = requests.post(f"{backend_url.rstrip('/')}/resume/upload", files=files, timeout=120)
+    resp.raise_for_status()
+    return resp.json()
 
-if use_groq and not st.session_state.get("api_key"):
-    st.warning("Enter API key in sidebar to enable LLM feedback generation. You can still run embeddings with SBERT.")
+def evaluate_resume_backend(job_id: int, resume_id: int, hard_weight: float, soft_weight: float, model_url: str = None, api_key: str = None, backend_url: str = API_BASE):
+    data = {
+        "job_id": str(job_id),
+        "resume_id": str(resume_id),
+        "hard_weight": str(hard_weight),
+        "soft_weight": str(soft_weight),
+    }
+    if model_url:
+        data["model_url"] = model_url
+    if api_key:
+        data["api_key"] = api_key
+    resp = requests.post(f"{backend_url.rstrip('/')}/evaluate", data=data, timeout=180)
+    resp.raise_for_status()
+    return resp.json()
 
-# helper for verdict chips
-def verdict_chip_html(verdict: str) -> str:
-    if verdict == "High":
-        return "<span class='chip chip-high'>✅ High</span>"
-    if verdict == "Medium":
-        return "<span class='chip chip-medium'>⚠️ Medium</span>"
-    return "<span class='chip chip-low'>❌ Low</span>"
-
-# cached providers
-@st.cache_resource
-def get_sbert_provider():
-    return SBERTEmbeddingsProvider()
-
-@st.cache_resource
-def get_openai_provider(api_key):
-    os.environ["OPENAI_API_KEY"] = api_key
-    return OpenAIEmbeddingsProvider(api_key)
-
-# embedding provider init
-if embedding_choice == "sbert":
-    try:
-        emb_provider = get_sbert_provider()
-    except Exception as e:
-        st.error(f"Failed to initialize SBERT embeddings: {e}")
-else:
-    if st.session_state.get("api_key"):
+# Optional: direct groq test from Streamlit (useful for debugging groq endpoint)
+def groq_direct_test(prompt: str, model_url: str, api_key: str, timeout: int = 30):
+    """
+    Send prompt directly to Groq endpoint from Streamlit for quick testing.
+    Tries common payload shapes (input, prompt, messages). Returns raw text response.
+    """
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "Accept": "application/json"}
+    bodies = [
+        {"input": prompt, "max_output_tokens": 1024, "temperature": 0.0},
+        {"prompt": prompt, "max_tokens": 1024, "temperature": 0.0},
+        {"messages": [{"role": "user", "content": prompt}], "max_tokens": 1024, "temperature": 0.0}
+    ]
+    last_err = None
+    for body in bodies:
         try:
-            emb_provider = get_openai_provider(st.session_state["api_key"])
-        except Exception:
-            st.warning("OpenAI init failed, falling back to SBERT.")
-            emb_provider = get_sbert_provider()
-    else:
-        st.warning("No API key found; using SBERT embeddings.")
-        emb_provider = get_sbert_provider()
-
-# scorer
-scorer = Scorer(weights={"hard": hard_weight, "soft": soft_weight})
-
-# --- JD Upload ---
-st.markdown("## 1) Upload Job Description")
-jd_file = st.file_uploader("Upload JD (PDF / DOCX / TXT)", type=["pdf", "docx", "txt"])
-jd_text = ""
-if jd_file:
-    tmp_jd = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(jd_file.name)[1])
-    tmp_jd.write(jd_file.getbuffer())
-    tmp_jd.close()
-    try:
-        if jd_file.name.lower().endswith(".pdf"):
-            jd_text = extract_text_from_pdf(tmp_jd.name)
-        elif jd_file.name.lower().endswith(".docx"):
-            jd_text = extract_text_from_docx(tmp_jd.name)
-        else:
-            jd_text = open(tmp_jd.name, "r", encoding="utf-8", errors="ignore").read()
-    except Exception as e:
-        st.error(f"Failed to extract JD text: {e}")
-        jd_text = ""
-
-if jd_text:
-    st.markdown("**JD preview (first 800 chars)**")
-    st.code(jd_text[:800] + ("..." if len(jd_text) > 800 else ""))
-
-    jd_sections = section_split(jd_text)
-
-    # --- Auto-skill extraction ---
-    candidates = re.findall(r'\b[A-Z][a-zA-Z0-9\+\#\.]{2,}\b', jd_text)
-    candidates = list(dict.fromkeys(candidates))  # dedupe
-    auto_skills = candidates[:25]
-
-    st.markdown("### 2) Skills (auto-detected — edit if needed)")
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        must_text = st.text_area("Must-have skills (comma separated)", value=",".join(auto_skills), height=120)
-        nice_text = st.text_area("Nice-to-have skills (comma separated)", value="", height=80)
-    with col2:
-        st.markdown("**Quick actions**")
-        if st.button("Use auto-detected skills"):
-            st.session_state["must_text"] = ",".join(auto_skills)
-            st.experimental_rerun()
-        st.markdown("**Embedding provider**")
-        st.write(f"Using: **{type(emb_provider).__name__}**")
-
-    must_have = [s.strip() for s in (st.session_state.get("must_text", must_text) or "").split(",") if s.strip()]
-    nice_to_have = [s.strip() for s in (nice_text or "").split(",") if s.strip()]
-else:
-    st.info("Please upload a Job Description to enable resume evaluation.")
-    must_have, nice_to_have = [], []
-
-st.markdown("---")
-
-# --- Resume Upload ---
-st.markdown("## 3) Upload Resumes")
-uploaded = st.file_uploader("Upload Resumes (PDF/DOCX) — multiple allowed", accept_multiple_files=True, type=["pdf", "docx"])
-
-if uploaded and not jd_text:
-    st.warning("Upload a Job Description first.")
-if uploaded and jd_text:
-    st.info(f"Processing {len(uploaded)} resumes...")
-    progress = st.progress(0)
-    results, failed = [], []
-    total = len(uploaded)
-
-    for idx, f in enumerate(uploaded, start=1):
-        status_placeholder = st.empty()
-        status_placeholder.info(f"Parsing {f.name} ({idx}/{total})...")
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(f.name)[1])
-        tmp.write(f.getbuffer())
-        tmp.close()
-
-        try:
-            text = extract_resume_text(tmp.name)
+            r = requests.post(model_url, headers=headers, json=body, timeout=timeout)
+            r.raise_for_status()
+            return r.text
         except Exception as e:
-            status_placeholder.error(f"Failed to parse {f.name}: {e}")
-            failed.append({"filename": f.name, "error": str(e)})
-            progress.progress(int((idx / total) * 100))
+            last_err = e
             continue
+    raise RuntimeError(f"Direct Groq request failed: {last_err}")
 
-        sections = section_split(text)
-        with st.expander(f"Preview parsed sections — {f.name}", expanded=False):
-            for k, v in sections.items():
-                st.markdown(f"**{k.title()}**")
-                st.code(v[:800] + ("..." if len(v) > 800 else ""))
+# -------------------------
+# UI: JD upload & parse
+# -------------------------
+st.header("1) Job Description (JD) — upload & parse (Groq)")
 
-        # scoring
-        try:
-            hard = scorer.hard_score(text, must_have, nice_to_have)
-        except Exception as e:
-            hard = 0.0
-            st.warning(f"Hard scoring failed for {f.name}: {e}")
-
-        try:
-            jd_vec = emb_provider.embed([jd_text])[0]
-            resume_vec = emb_provider.embed([text])[0]
-            soft = scorer.soft_score(jd_vec, resume_vec)
-        except Exception as e:
-            st.warning(f"Soft score failed for {f.name}: {e}")
-            soft = 0.0
-
-        final = scorer.final_score(hard, soft)
-        verdict = scorer.verdict(final)
-
-        # missing skills
-        try:
-            skill_map = extract_skills(text, must_have)
-            matched = {k for k, v in skill_map.items() if v >= 70}
-            missing = [k for k in must_have if k not in matched]
-        except Exception:
-            matched, missing = set(), must_have.copy()
-
-        # feedback
-        feedback_text = "Feedback disabled (no API key or LLM disabled)."
-        if use_groq and st.session_state.get("api_key"):
-            os.environ["GROQ_API_KEY"] = st.session_state["api_key"]
-            try:
-                feedback_text = generate_feedback(text, jd_text, missing)[:3000]
-            except Exception as e:
-                feedback_text = f"Feedback generation failed: {e}"
-
-        results.append({
-            "filename": f.name,
-            "score": round(final, 2),
-            "verdict": verdict,
-            "hard": round(hard, 2),
-            "soft": round(soft, 2),
-            "missing": missing,
-            "feedback": feedback_text
-        })
-
-        progress.progress(int((idx / total) * 100))
-        status_placeholder.success(f"Processed {f.name}: score {final:.1f} — {verdict}")
-
-    # --- Results ---
-    st.markdown("## Results")
-    df = pd.DataFrame(results)
-    if df.empty:
-        st.info("No successful results.")
-    else:
-        colf1, colf2, colf3 = st.columns([1,1,2])
-        with colf1:
-            min_score = st.slider("Minimum score", min_value=0, max_value=100, value=0)
-        with colf2:
-            verdict_filter = st.selectbox("Verdict", options=["All", "High", "Medium", "Low"], index=0)
-        with colf3:
-            text_filter = st.text_input("Filename contains", value="")
-
-        df_display = df[df["score"] >= min_score]
-        if verdict_filter != "All":
-            df_display = df_display[df_display["verdict"] == verdict_filter]
-        if text_filter.strip():
-            df_display = df_display[df_display["filename"].str.contains(text_filter, case=False, na=False)]
-
-        for _, row in df_display.iterrows():
-            c1, c2 = st.columns([4,1])
-            with c1:
-                st.markdown(f"<div class='card'><b>{row['filename']}</b> — Score: <b>{row['score']}</b> | Hard: {row['hard']} | Soft: {row['soft']}</div>", unsafe_allow_html=True)
-                if row['missing']:
-                    st.markdown("**Missing skills:**")
-                    tags_html = " ".join([f"<span class='tag'>{s}</span>" for s in row['missing']])
-                    st.markdown(tags_html, unsafe_allow_html=True)
-                else:
-                    st.markdown("**Missing skills:** None")
-                st.markdown("**Feedback (short):**")
-                st.info(row['feedback'])
-            with c2:
-                st.markdown(verdict_chip_html(row['verdict']), unsafe_allow_html=True)
-
-        csv = df_display.to_csv(index=False)
-        st.download_button("Download filtered results (CSV)", csv, file_name="resume_relevance_results.csv", mime="text/csv")
-
-        if store_kind != "none":
-            if st.button("Save vectors to vector store"):
+col1, col2 = st.columns([3, 1])
+with col1:
+    jd_file = st.file_uploader("Upload JD (pdf / docx / txt)", type=["pdf", "docx", "txt"])
+    jd_title = st.text_input("Optional job title (sent to backend)", value="")
+with col2:
+    st.write("Groq debug")
+    if st.button("Test Groq endpoint (quick)"):
+        if not groq_url or not groq_key:
+            st.warning("Please provide Groq URL & API key in the sidebar first.")
+        else:
+            with st.spinner("Calling Groq directly..."):
                 try:
-                    vs = VectorStoreWrapper(kind=store_kind)
-                    for r in results:
-                        vs.upsert(id=r['filename'], vector=emb_provider.embed([r['filename']])[0], metadata={"score": r['score'], "missing": r['missing']})
-                    st.success("Saved vectors.")
+                    test_prompt = "Return a JSON object: { 'hello': 'world' }"
+                    resp_text = groq_direct_test(test_prompt, groq_url, groq_key)
+                    st.success("Groq responded (truncated):")
+                    st.code(resp_text[:2000])
                 except Exception as e:
-                    st.error(f"Failed to save vectors: {e}")
+                    show_exception(e)
+
+if jd_file:
+    jd_bytes = jd_file.read()
+    st.subheader("Preview (first 1200 chars)")
+    st.code(preview_text_from_bytes(jd_bytes, jd_file.name)[:1200])
+    st.write("")
+    parse_col, fallback_col = st.columns(2)
+    with parse_col:
+        if st.button("Parse JD (Groq)"):
+            if not use_groq_checkbox:
+                st.warning("Groq usage is disabled in the UI. Toggle 'Use Groq' in the sidebar if you want to use Groq.")
+            else:
+                st.info("Uploading JD to backend and requesting Groq-based parse...")
+                try:
+                    out = upload_jd_to_backend(jd_bytes, jd_file.name, title=jd_title, use_groq=True, model_url=groq_url or None, api_key=groq_key or None, backend_url=API_BASE)
+                    st.success("JD uploaded and parsed — backend response:")
+                    st.json(out.get("parsed", out))
+                    # store job_id for later evaluation
+                    job_id = out.get("job_id")
+                    if job_id:
+                        st.session_state["job_id"] = job_id
+                        st.info(f"Saved job_id {job_id} to session.")
+                except Exception as e:
+                    st.error("JD parse/upload failed. Backend responded with an error — falling back to local heuristic parse (display only).")
+                    show_exception(e)
+                    # optional: call local heuristic parse (if available in same env)
+                    try:
+                        from backend.services.jd_parser import parse_jd as local_parse
+                        parsed_local = local_parse(jd_bytes.decode("utf-8", errors="ignore"), use_groq=False)
+                        st.subheader("Local heuristic parse result (fallback)")
+                        st.json(parsed_local)
+                    except Exception:
+                        st.warning("Local heuristic parser not available in this Streamlit environment.")
+    with fallback_col:
+        if st.button("Parse JD (Local heuristic)"):
+            try:
+                # Try to call local heuristic if backend.services present (works when streamlit runs in same env)
+                from backend.services.jd_parser import parse_jd as local_parse
+                parsed_local = local_parse(preview_text_from_bytes(jd_bytes, jd_file.name), use_groq=False)
+                st.json(parsed_local)
+            except Exception as e:
+                st.warning("Local parse not available here. Upload JD to backend instead.")
+                show_exception(e)
+
+# -------------------------
+# UI: Resumes upload & evaluate
+# -------------------------
+st.header("2) Upload resumes and evaluate against uploaded JD")
+
+resume_files = st.file_uploader("Upload resumes (multiple). After upload, click Evaluate.", accept_multiple_files=True, type=["pdf", "docx", "txt"])
+hard_weight = st.slider("Hard match weight", min_value=0.0, max_value=1.0, value=0.6, step=0.05)
+soft_weight = round(1.0 - hard_weight, 2)
+st.write(f"Soft weight = {soft_weight}")
+
+if st.button("Upload resumes & evaluate (backend)"):
+    if "job_id" not in st.session_state:
+        st.error("No job_id in session. Upload & parse a JD first (Parse JD (Groq)).")
+    else:
+        job_id = int(st.session_state["job_id"])
+        results = []
+        for f in resume_files:
+            try:
+                st.info(f"Uploading {f.name} ...")
+                b = f.read()
+                r_up = upload_resume_to_backend(b, f.name, backend_url=API_BASE)
+                resume_id = r_up.get("resume_id")
+                st.success(f"Uploaded {f.name} (resume_id={resume_id}). Evaluating...")
+                # call evaluate - pass groq creds to ensure evaluator uses Groq
+                eval_out = evaluate_resume_backend(job_id, resume_id, hard_weight, soft_weight, model_url=groq_url or None, api_key=groq_key or None, backend_url=API_BASE)
+                results.append({"filename": f.name, "result": eval_out.get("result", eval_out)})
+            except Exception as e:
+                st.error(f"Failed {f.name}: {e}")
+                st.text(traceback.format_exc())
+
+        if results:
+            # sort by final score
+            results = sorted(results, key=lambda x: x["result"].get("final", 0), reverse=True)
+            st.header("Evaluation results (sorted by final score)")
+            for r in results:
+                res = r["result"]
+                st.subheader(f"{r['filename']} — Score: {res.get('final', 'N/A')}  Verdict: {res.get('verdict','N/A')}")
+                st.write("Hard:", res.get("hard"), "Soft:", res.get("soft"))
+                missing = res.get("missing", {})
+                st.write("Missing (must):", missing.get("must", []))
+                st.write("Missing (good):", missing.get("good", []))
+                fb = res.get("feedback", [])
+                if fb:
+                    st.write("Feedback:")
+                    for item in fb[:6]:
+                        st.markdown(f"- {item}")
+                # show raw groq response if present (debugging)
+                if isinstance(res.get("raw_groq_response"), str):
+                    with st.expander("Raw Groq response (debug)"):
+                        st.code(res.get("raw_groq_response")[:4000])
+
+# -------------------------
+# UI: View results stored in backend
+# -------------------------
+st.header("3) View stored evaluations (backend)")
+
+job_id_input = st.number_input("Job ID to fetch results", min_value=0, step=1, value=int(st.session_state.get("job_id", 0)))
+if st.button("Fetch results for job"):
+    try:
+        r = requests.get(f"{API_BASE.rstrip('/')}/results/{int(job_id_input)}", timeout=60)
+        r.raise_for_status()
+        out = r.json()
+        st.json(out)
+    except Exception as e:
+        show_exception(e)
+
+# -------------------------
+# Footer / debug helpers
+# -------------------------
+st.markdown("---")
+st.markdown("**Debug helpers**")
+if st.checkbox("Show environment vars (debug)"):
+    env_preview = {
+        "API_BASE": API_BASE,
+        "GROQ_API_URL (sidebar)": groq_url,
+        "GROQ_API_KEY (sidebar set?)": bool(groq_key),
+        "Use Groq (checkbox)": use_groq_checkbox
+    }
+    st.json(env_preview)
+
+st.caption("If Groq parsing fails return contains parse_error/groq_raw or groq_exception keys. Copy raw to adjust groq_client payload shapes in backend.")
