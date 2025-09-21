@@ -31,6 +31,10 @@ css = """
         background-color: #0b0b0d;
         color: #e6e6e6;
     }
+    /* This rule makes all markdown headings yellow */
+    h1, h2, h3, h4, h5, h6 {
+        color: #FFD700;
+    }
     .css-18e3th9 { background-color: #0b0b0d; }
     .stButton>button { background-color: #111; color: #fff; border-radius:8px; }
     .title { font-family: 'Helvetica', sans-serif; color:#FFD700; font-weight:700;}
