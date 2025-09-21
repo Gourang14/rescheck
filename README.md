@@ -1,39 +1,49 @@
-# Resume Relevance Check — MVP
+# Resume Relevance Check — MVP 🦇
 
-## Quick start (local)
+An **AI-powered system** that evaluates resumes against job descriptions (JDs).  
+It produces a **Relevance Score (0–100)**, highlights missing skills, and generates actionable feedback — helping recruiters quickly shortlist candidates.
 
-1. Create venv and install
-
-```bash
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
-2. Set OpenAI key (optional but recommended for embeddings)
-
-```bash
-export OPENAI_API_KEY="sk-..."
-```
-
-3. Run API
-
-```bash
-uvicorn app.main:app --reload --port 8000
-```
-
-4. Open Streamlit dashboard (in another terminal)
-
-```bash
-streamlit run dashboard/streamlit_app.py
-```
-
-5. Use `demo.sh` to test (requires `jq` & sample files in `sample_data/`)
-
-
-## Notes
-- This is an MVP. For production: use S3 for file storage, persistent vector DB (Chroma/Pinecone), job queue for async batch processing, and add authentication.
-```
+This project is part of **Theme 2 — Automated Resume Relevance Check System (Innomatics Research Labs)**.
 
 ---
-https://rescheck-dg9pxsukuzrznexktcy3a6.streamlit.app/
+
+## ✨ Features
+- 📄 Upload **Job Descriptions** (PDF/DOCX/TXT).
+- 📑 Upload **Resumes** (PDF/DOCX, multiple at once).
+- ⚖️ **Hybrid Scoring**:
+  - **Hard Match**: keyword & fuzzy skill matching.
+  - **Soft Match**: semantic similarity via embeddings.
+- 🎯 Outputs:
+  - Final **Relevance Score** (0–100).
+  - Verdict: ✅ High / ⚠️ Medium / ❌ Low.
+  - Missing Skills.
+  - Actionable Feedback.
+- 📊 Dashboard for placement team:
+  - Upload JD & resumes.
+  - Ranked shortlist + filtering.
+  - Stored evaluations history (SQLite).
+- 🧩 Modular backend (LangChain, embeddings, vector store ready).
+
+---
+
+## 🛠️ Tech Stack
+**Backend**
+- FastAPI (resume/JD processing APIs)
+- SQLite (MVP DB) → can scale to PostgreSQL
+- LangChain, SBERT/OpenAI embeddings
+- RapidFuzz (fuzzy matching), PyMuPDF / python-docx
+
+**Frontend**
+- Streamlit dashboard (upload, review, filtering)
+
+---
+
+## 🚀 Quick Start (Local)
+
+1. **Clone repo & setup environment**
+```bash
+git clone https://github.com/your-org/rescheck.git
+cd rescheck
+python -m venv venv
+source venv/bin/activate   # on Windows: venv\Scripts\activate
+pip install -r requirements.txt
